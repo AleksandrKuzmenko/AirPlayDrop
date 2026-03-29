@@ -41,14 +41,12 @@ struct PlaylistRowView: View {
                 }
             }
             Spacer()
-            if !item.state.displayLabel.isEmpty {
-                Text(item.state.displayLabel)
-                    .font(.caption2)
-                    .foregroundStyle(labelColor)
-            }
+            trailingLabel
         }
         .padding(.vertical, 2)
     }
+
+    // MARK: - Sub-views
 
     @ViewBuilder
     private var stateIndicator: some View {
@@ -57,14 +55,31 @@ struct PlaylistRowView: View {
             ProgressView()
                 .scaleEffect(0.6)
                 .frame(width: 14, height: 14)
+        case .transcoding:
+            SpinningIcon()
         case .unsupported, .failed:
             Image(systemName: "exclamationmark.circle.fill")
                 .foregroundStyle(.red)
                 .font(.caption)
+                .help(item.state.errorDescription ?? "Cannot play this file")
         default:
             Image(systemName: "film")
                 .foregroundStyle(.secondary)
                 .font(.caption)
+        }
+    }
+
+    @ViewBuilder
+    private var trailingLabel: some View {
+        if case .transcoding(let progress) = item.state {
+            ProgressView(value: progress)
+                .progressViewStyle(.linear)
+                .frame(width: 60)
+                .tint(.orange)
+        } else if !item.state.displayLabel.isEmpty {
+            Text(item.state.displayLabel)
+                .font(.caption2)
+                .foregroundStyle(labelColor)
         }
     }
 
@@ -73,5 +88,22 @@ struct PlaylistRowView: View {
         case .unsupported, .failed: return .red
         default: return .secondary
         }
+    }
+}
+
+/// Rotating icon for transcoding state — uses plain rotation to stay on macOS 14+.
+private struct SpinningIcon: View {
+    @State private var degrees = 0.0
+
+    var body: some View {
+        Image(systemName: "arrow.triangle.2.circlepath")
+            .foregroundStyle(.orange)
+            .font(.caption)
+            .rotationEffect(.degrees(degrees))
+            .onAppear {
+                withAnimation(.linear(duration: 1.5).repeatForever(autoreverses: false)) {
+                    degrees = 360
+                }
+            }
     }
 }

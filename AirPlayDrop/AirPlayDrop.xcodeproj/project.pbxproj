@@ -20,6 +20,7 @@
 		AB0001000000000000000040 /* PlaybackController.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000020 /* PlaybackController.swift */; };
 		AB0001000000000000000041 /* FileImportService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000021 /* FileImportService.swift */; };
 		AB0001000000000000000042 /* MetadataLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000022 /* MetadataLoader.swift */; };
+		AB0001000000000000000046 /* TranscodeService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000028 /* TranscodeService.swift */; };
 		AB0001000000000000000043 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000023 /* Assets.xcassets */; };
 		AB0001000000000000000044 /* AVKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000026 /* AVKit.framework */; };
 		AB0001000000000000000045 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000027 /* AVFoundation.framework */; };
@@ -42,6 +43,7 @@
 		AB0001000000000000000022 /* MetadataLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetadataLoader.swift; sourceTree = "<group>"; };
 		AB0001000000000000000023 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		AB0001000000000000000024 /* AirPlayDrop.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = AirPlayDrop.entitlements; sourceTree = "<group>"; };
+		AB0001000000000000000028 /* TranscodeService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscodeService.swift; sourceTree = "<group>"; };
 		AB0001000000000000000026 /* AVKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVKit.framework; path = System/Library/Frameworks/AVKit.framework; sourceTree = SDKROOT; };
 		AB0001000000000000000027 /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
@@ -101,6 +103,7 @@
 				AB0001000000000000000020 /* PlaybackController.swift */,
 				AB0001000000000000000021 /* FileImportService.swift */,
 				AB0001000000000000000022 /* MetadataLoader.swift */,
+				AB0001000000000000000028 /* TranscodeService.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -213,6 +216,7 @@
 				AB0001000000000000000040 /* PlaybackController.swift in Sources */,
 				AB0001000000000000000041 /* FileImportService.swift in Sources */,
 				AB0001000000000000000042 /* MetadataLoader.swift in Sources */,
+				AB0001000000000000000046 /* TranscodeService.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

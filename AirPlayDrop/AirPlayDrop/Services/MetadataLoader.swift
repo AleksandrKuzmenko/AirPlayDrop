@@ -10,20 +10,21 @@ struct MetadataLoader {
         logger.debug("Loading metadata for '\(item.displayName)'")
         item.state = .loading
 
-        let url = item.fileURL
-        let asset = AVURLAsset(url: url)
+        let asset = AVURLAsset(url: item.fileURL)
 
         do {
+            // Best-effort duration load regardless of playability — useful for
+            // transcode progress reporting on files AVFoundation can't play.
+            if let duration = try? await asset.load(.duration),
+               duration.isValid && !duration.isIndefinite {
+                item.duration = CMTimeGetSeconds(duration)
+            }
+
             let isPlayable = try await asset.load(.isPlayable)
             guard isPlayable else {
                 logger.warning("Asset not playable: \(item.displayName)")
                 item.state = .unsupported
                 return
-            }
-
-            let duration = try await asset.load(.duration)
-            if duration.isValid && !duration.isIndefinite {
-                item.duration = CMTimeGetSeconds(duration)
             }
 
             item.state = .ready
