@@ -72,10 +72,11 @@ struct PlaylistRowView: View {
     @ViewBuilder
     private var trailingLabel: some View {
         if case .transcoding(let progress) = item.state {
-            ProgressView(value: progress)
-                .progressViewStyle(.linear)
-                .frame(width: 60)
-                .tint(.orange)
+            Text(progress > 0 ? "\(Int(progress * 100))%" : "…")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+                .monospacedDigit()
+                .frame(width: 32, alignment: .trailing)
         } else if !item.state.displayLabel.isEmpty {
             Text(item.state.displayLabel)
                 .font(.caption2)

@@ -17,7 +17,7 @@ struct MainWindowView: View {
             // Playlist (left) + video surface (right)
             HSplitView {
                 PlaylistView(store: store, onRemove: remove)
-                    .frame(minWidth: 180, idealWidth: 220, maxWidth: 300)
+                    .frame(minWidth: 180, idealWidth: 300, maxWidth: 350)
 
                 videoSurface
                     .frame(minWidth: 300)
@@ -37,13 +37,37 @@ struct MainWindowView: View {
         // Wire AVPlayer failure → retranscode pipeline
         .task {
             controller.onPlaybackFailure = { [weak store] item in
-                store?.retranscode(item)
+                // Audio codec incompatible — skip remux, try audio-transcode (AAC).
+                store?.retranscode(item, startingAt: 1)
+            }
+            controller.onVideoRenderFailure = { [weak store] item in
+                // Video codec not renderable — skip remux + audio-transcode, full re-encode to H.264.
+                store?.retranscode(item, startingAt: 2)
             }
         }
         // Open File… (menu / ⌘O)
         .onReceive(NotificationCenter.default.publisher(for: .openFileRequested)) { _ in
             FileImportService.openPanel { urls in
                 store.add(urls: FileImportService.filter(urls))
+            }
+        }
+        .alert(
+            "Transcode Required",
+            isPresented: Binding(
+                get: { store.transcodeRequest != nil },
+                set: { if !$0 { store.confirmTranscode(false) } }
+            )
+        ) {
+            Button("Transcode") { store.confirmTranscode(true) }
+            Button("Cancel", role: .cancel) { store.confirmTranscode(false) }
+        } message: {
+            if let req = store.transcodeRequest {
+                Text("""
+                '\(req.item.displayName)' needs to be transcoded before it can be cast via AirPlay.
+
+                The result will be saved as '\(req.outputURL.lastPathComponent)' in the same folder. \
+                This may take several minutes for large files.
+                """)
             }
         }
     }

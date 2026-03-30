@@ -12,9 +12,13 @@ final class PlaybackController {
     private(set) var isPlaying = false
     private(set) var loadedItem: MediaItem?
 
-    /// Called when AVPlayer reports a fatal item failure (e.g. unsupported codec at runtime).
-    /// PlaylistStore wires this to `store.retranscode(_:)`.
+    /// Called when AVPlayer reports a fatal item failure (e.g. unsupported audio codec).
+    /// PlaylistStore wires this to `store.retranscode(_:startingAt:)` with index 1.
     var onPlaybackFailure: ((MediaItem) -> Void)?
+
+    /// Called when AVPlayer can decode the item but produces no video image (e.g. unsupported
+    /// HEVC profile). PlaylistStore wires this to `store.retranscode(_:startingAt:)` with index 2.
+    var onVideoRenderFailure: ((MediaItem) -> Void)?
 
     private var endObserver: Any?
     private var statusObservation: NSKeyValueObservation?
@@ -82,17 +86,36 @@ final class PlaybackController {
     private func observeStatus(of playerItem: AVPlayerItem, mediaItem: MediaItem) {
         statusObservation?.invalidate()
         statusObservation = playerItem.observe(\.status, options: [.new]) { item, _ in
-            guard item.status == .failed else { return }
-            let desc = item.error?.localizedDescription ?? "Playback pipeline failed"
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                logger.error("AVPlayerItem failed: \(desc)")
-                self.isPlaying = false
-                self.player.replaceCurrentItem(with: nil)
-                // Mark item as failed so the UI reflects the state,
-                // then hand off to the transcode pipeline.
-                mediaItem.state = .failed(desc)
-                self.onPlaybackFailure?(mediaItem)
+            switch item.status {
+            case .failed:
+                let desc = item.error?.localizedDescription ?? "Playback pipeline failed"
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    logger.error("AVPlayerItem failed: \(desc)")
+                    self.isPlaying = false
+                    self.player.replaceCurrentItem(with: nil)
+                    mediaItem.state = .failed(desc)
+                    self.onPlaybackFailure?(mediaItem)
+                }
+
+            case .readyToPlay:
+                // Detect audio-only output when a video track is present — the video codec
+                // decoded successfully from AVFoundation's perspective but VideoToolbox can't
+                // render frames (e.g. 10-bit HEVC on unsupported hardware/profile).
+                let hasVideo = item.tracks.contains { $0.assetTrack?.mediaType == .video }
+                let size = item.presentationSize
+                guard hasVideo && size == .zero else { return }
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    logger.error("AVPlayerItem: video track present but no image (presentationSize=zero) — triggering full transcode")
+                    self.isPlaying = false
+                    self.player.replaceCurrentItem(with: nil)
+                    mediaItem.state = .failed("Video codec not renderable; re-encoding to H.264")
+                    self.onVideoRenderFailure?(mediaItem)
+                }
+
+            default:
+                break
             }
         }
     }
