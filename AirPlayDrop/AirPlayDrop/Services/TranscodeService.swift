@@ -244,11 +244,7 @@ struct TranscodeService {
         let errPipe = Pipe()
         process.standardError = errPipe
 
-        // Captured as var so the readabilityHandler can fill it in from FFmpeg's
-        // header if AVFoundation didn't provide a duration (item.duration == nil).
-        var effectiveDuration = item.duration ?? 0
-        // Accumulates stderr so we can log it on failure for diagnosis.
-        var stderrLog = ""
+        let effectiveDuration = item.duration ?? 0
 
         // Wire up real-time progress via readabilityHandler (background thread → @MainActor).
         errPipe.fileHandleForReading.readabilityHandler = { [weak item] handle in
@@ -256,19 +252,9 @@ struct TranscodeService {
             guard !data.isEmpty,
                   let text = String(data: data, encoding: .utf8) else { return }
 
-            stderrLog += text
-            if stderrLog.utf8.count > 32_768 {
-                stderrLog = String(stderrLog.suffix(32_768))
-            }
-
             for line in text.components(separatedBy: .newlines) {
                 // Fallback: grab total duration from FFmpeg's "  Duration: HH:MM:SS.ss, ..."
                 // header line when AVFoundation couldn't provide it.
-                if effectiveDuration <= 0, let d = parseDuration(line) {
-                    effectiveDuration = d
-                    Task { @MainActor [weak item] in item?.duration = d }
-                }
-
                 guard effectiveDuration > 0, let secs = parseOutTime(line) else { continue }
                 let progress = min(secs / effectiveDuration, 0.99)
                 Task { @MainActor [weak item] in
@@ -300,7 +286,7 @@ struct TranscodeService {
         }
 
         guard exitCode == 0 else {
-            logger.error("FFmpeg exited \(exitCode), stderr:\n\(stderrLog)")
+            logger.error("FFmpeg exited \(exitCode)")
             throw TranscodeError.processFailed(exitCode)
         }
     }
