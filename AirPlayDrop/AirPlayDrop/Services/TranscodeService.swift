@@ -110,6 +110,7 @@ struct TranscodeService {
                 let validation = await MediaArtifactValidator.validate(reservation.temporary)
                 guard validation.isValid else { throw TranscodeError.invalidOutput(validation.reason ?? "Output validation failed") }
                 try FileManager.default.moveItem(at: reservation.temporary, to: reservation.destination)
+                try? MediaArtifactValidator.writeManifest(source: item.fileURL, artifact: reservation.destination, validation: validation)
                 item.transcodedURL = reservation.destination
                 item.state = .ready
                 logger.debug("[\(strategy.name)] done: '\(item.displayName)'")
@@ -191,6 +192,7 @@ struct TranscodeService {
                 let validation = await MediaArtifactValidator.validate(reservation.temporary)
                 guard validation.isValid else { throw TranscodeError.invalidOutput(validation.reason ?? "Output validation failed") }
                 try FileManager.default.moveItem(at: reservation.temporary, to: reservation.destination)
+                try? MediaArtifactValidator.writeManifest(source: item.fileURL, artifact: reservation.destination, validation: validation)
                 item.transcodedURL = reservation.destination
                 item.isAirPlayPrepared = true
                 item.state = .ready

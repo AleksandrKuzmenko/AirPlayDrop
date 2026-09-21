@@ -164,7 +164,7 @@ final class PlaylistStore {
             if case .unsupported = item.state {
                 let outputURL = TranscodeService.outputURL(for: item.fileURL)
 
-                let cached = await MediaArtifactValidator.validate(outputURL)
+                let cached = await MediaArtifactValidator.validateCached(outputURL, source: item.fileURL)
                 if cached.isValid {
                     item.transcodedURL = outputURL
                     item.state = .ready

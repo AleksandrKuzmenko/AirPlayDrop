@@ -27,7 +27,26 @@
 		AB0001000000000000000076 /* MediaArtifactValidator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000077 /* MediaArtifactValidator.swift */; };
 		AB0001000000000000000078 /* MediaTrack.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000079 /* MediaTrack.swift */; };
 		AB0001000000000000000081 /* FFmpegLocator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000082 /* FFmpegLocator.swift */; };
+		AB0001000000000000000083 /* AirPlayDropTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000084 /* AirPlayDropTests.swift */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		AB0001000000000000000093 /* Container Proxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = AB0001000000000000000090 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = AB0001000000000000000080;
+			remoteInfo = AirPlayDrop;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXTargetDependency section */
+		AB0001000000000000000092 /* Target dependency */ = {
+			isa = PBXTargetDependency;
+			target = AB0001000000000000000080 /* AirPlayDrop */;
+			targetProxy = AB0001000000000000000093 /* Container Proxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin PBXFileReference section */
 		AB0001000000000000000001 /* AirPlayDrop.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AirPlayDrop.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -52,6 +71,8 @@
 		AB0001000000000000000077 /* MediaArtifactValidator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaArtifactValidator.swift; sourceTree = "<group>"; };
 		AB0001000000000000000079 /* MediaTrack.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaTrack.swift; sourceTree = "<group>"; };
 		AB0001000000000000000082 /* FFmpegLocator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FFmpegLocator.swift; sourceTree = "<group>"; };
+		AB0001000000000000000084 /* AirPlayDropTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AirPlayDropTests.swift; sourceTree = "<group>"; };
+		AB0001000000000000000085 /* AirPlayDropTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AirPlayDropTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -121,6 +142,7 @@
 			isa = PBXGroup;
 			children = (
 				AB0001000000000000000001 /* AirPlayDrop.app */,
+				AB0001000000000000000085 /* AirPlayDropTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -134,10 +156,17 @@
 			name = Frameworks;
 			sourceTree = "<group>";
 		};
+		AB0001000000000000000091 /* Tests */ = {
+			isa = PBXGroup;
+			children = (AB0001000000000000000084 /* AirPlayDropTests.swift */);
+			path = Tests;
+			sourceTree = "<group>";
+		};
 		AB0001000000000000000008 = {
 			isa = PBXGroup;
 			children = (
 				AB0001000000000000000002 /* AirPlayDrop */,
+				AB0001000000000000000091 /* Tests */,
 				AB0001000000000000000007 /* Frameworks */,
 				AB0001000000000000000006 /* Products */,
 			);
@@ -163,6 +192,20 @@
 			productReference = AB0001000000000000000001 /* AirPlayDrop.app */;
 			productType = "com.apple.product-type.application";
 		};
+		AB0001000000000000000086 /* AirPlayDropTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AB0001000000000000000089 /* Build configuration list for PBXNativeTarget "AirPlayDropTests" */;
+			buildPhases = (
+				AB0001000000000000000087 /* Test Sources */,
+				AB0001000000000000000088 /* Test Frameworks */,
+			);
+			buildRules = ();
+			dependencies = (AB0001000000000000000092 /* Target dependency */);
+			name = AirPlayDropTests;
+			productName = AirPlayDropTests;
+			productReference = AB0001000000000000000085 /* AirPlayDropTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -175,6 +218,10 @@
 				TargetAttributes = {
 					AB0001000000000000000080 = {
 						CreatedOnToolsVersion = 15.0;
+					};
+					AB0001000000000000000086 = {
+						CreatedOnToolsVersion = 15.0;
+						TestTargetID = AB0001000000000000000080;
 					};
 				};
 			};
@@ -192,6 +239,7 @@
 			projectRoot = "";
 			targets = (
 				AB0001000000000000000080 /* AirPlayDrop */,
+				AB0001000000000000000086 /* AirPlayDropTests */,
 			);
 		};
 /* End PBXProject section */
@@ -230,6 +278,18 @@
 				AB0001000000000000000078 /* MediaTrack.swift in Sources */,
 				AB0001000000000000000081 /* FFmpegLocator.swift in Sources */,
 			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AB0001000000000000000087 /* Test Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (AB0001000000000000000083 /* AirPlayDropTests.swift in Sources */);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AB0001000000000000000088 /* Test Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = ();
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
@@ -407,6 +467,34 @@
 			};
 			name = Release;
 		};
+		AB0001000000000000000094 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.airplaydrop.AirPlayDropTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_VERSION = 5.9;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/AirPlayDrop.app/Contents/MacOS/AirPlayDrop";
+			};
+			name = Debug;
+		};
+		AB0001000000000000000095 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.airplaydrop.AirPlayDropTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_VERSION = 5.9;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/AirPlayDrop.app/Contents/MacOS/AirPlayDrop";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -424,6 +512,15 @@
 			buildConfigurations = (
 				AB0001000000000000000062 /* Debug */,
 				AB0001000000000000000063 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		AB0001000000000000000089 /* Build configuration list for PBXNativeTarget "AirPlayDropTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AB0001000000000000000094 /* Debug */,
+				AB0001000000000000000095 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
