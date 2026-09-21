@@ -126,7 +126,6 @@ final class PlaylistStore {
         let out = TranscodeService.outputURL(for: item.fileURL)
         try? FileManager.default.removeItem(at: out)
         item.transcodedURL = nil
-        item.isAirPlayPrepared = false
         item.state = .idle
         processTasks[item.id] = processItem(item)
     }
@@ -138,7 +137,6 @@ final class PlaylistStore {
         let out = TranscodeService.outputURL(for: item.fileURL)
         try? FileManager.default.removeItem(at: out)
         item.transcodedURL = nil
-        item.isAirPlayPrepared = false
         item.state = .idle
         processTasks[item.id] = Task { [weak self] in
             guard let self else { return }
@@ -146,11 +144,7 @@ final class PlaylistStore {
             let confirmed = await self.requestTranscodeConfirmation(
                 for: item, startingAt: 2, outputURL: outputURL)
             if confirmed {
-                await TranscodeService.processForAirPlay(item: item)
-                if item.state == .ready {
-                    let asset = AVURLAsset(url: item.playbackURL)
-                    item.formatFlags = await VideoFormatProbe.inspect(asset)
-                }
+                await TranscodeService.process(item: item, startingAt: 2)
             } else {
                 item.state = .ready
             }
@@ -189,7 +183,6 @@ final class PlaylistStore {
             if item.state == .ready {
                 let asset = AVURLAsset(url: item.playbackURL)
                 item.formatFlags = await VideoFormatProbe.inspect(asset)
-                item.isAirPlayPrepared = await VideoFormatProbe.isAirPlayPrepared(asset)
             }
 
             if self.selectedID == nil, item.state == .ready {

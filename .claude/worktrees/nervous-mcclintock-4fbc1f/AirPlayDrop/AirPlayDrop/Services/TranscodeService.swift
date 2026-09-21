@@ -77,15 +77,14 @@ struct TranscodeService {
             // 0: remux — repackage unchanged streams, instant, lossless.
             ("remux",                ["-c", "copy"]),
             // 1: audio-transcode — copy video, re-encode audio to AAC. Handles DTS/TrueHD/EAC3.
-            ("audio-transcode",      ["-c:v", "copy", "-c:a", "aac", "-ac:a", "2",
-                                      "-b:a", "192k"]),
+            ("audio-transcode",      ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]),
             // 2: hw-video-transcode — VideoToolbox H.264 (GPU/media engine, fast).
             //    Handles HEVC/VP9/AV1 that VideoToolbox can't decode for playback.
             ("hw-video-transcode",   ["-c:v", "h264_videotoolbox", "-b:v", "5000k",
-                                      "-c:a", "aac", "-ac:a", "2", "-b:a", "192k"]),
+                                      "-c:a", "aac", "-b:a", "192k"]),
             // 3: sw-video-transcode — libx264 software fallback, handles anything FFmpeg decodes.
             ("sw-video-transcode",   ["-c:v", "libx264", "-preset", "fast", "-crf", "20",
-                                      "-c:a", "aac", "-ac:a", "2", "-b:a", "192k"]),
+                                      "-c:a", "aac", "-b:a", "192k"]),
         ]
 
         let start = min(startingAt, strategies.count)
@@ -121,80 +120,6 @@ struct TranscodeService {
         if end >= strategies.count {
             item.state = .failed("No transcode strategy succeeded. Check Console for details.")
         }
-    }
-
-    /// Produces an Apple TV friendly HDR10 MP4 from an HDR/Dolby Vision source.
-    ///
-    /// The fast path keeps the HEVC Main 10 HDR10-compatible base layer and removes
-    /// Dolby Vision RPU NAL units (type 62). If the source cannot be remuxed, the
-    /// fallback re-encodes to HEVC Main 10 with VideoToolbox while preserving the
-    /// BT.2020/PQ HDR signalling.
-    @MainActor
-    static func processForAirPlay(item: MediaItem) async {
-        guard let ffmpeg = findFFmpeg() else {
-            item.state = .failed(TranscodeError.ffmpegNotFound.localizedDescription)
-            return
-        }
-
-        let output = outputURL(for: item.fileURL)
-        try? FileManager.default.removeItem(at: output)
-
-        let streamArgs = [
-            "-map", "0:v:0",
-            "-map", "0:a:0?",
-            "-map_metadata", "-1",
-            "-map_chapters", "-1",
-            "-sn", "-dn",
-        ]
-        let strategies: [(name: String, codecArgs: [String])] = [
-            (
-                "airplay-hdr10-remux",
-                streamArgs + [
-                    "-c:v", "copy",
-                    "-bsf:v", "filter_units=remove_types=62",
-                    "-tag:v", "hvc1",
-                    "-c:a", "aac", "-ac:a", "2", "-b:a", "192k",
-                ]
-            ),
-            (
-                "airplay-hdr10-videotoolbox",
-                streamArgs + [
-                    "-c:v", "hevc_videotoolbox",
-                    "-profile:v", "main10",
-                    "-pix_fmt", "p010le",
-                    "-b:v", "12000k",
-                    "-tag:v", "hvc1",
-                    "-c:a", "aac", "-ac:a", "2", "-b:a", "192k",
-                ]
-            ),
-        ]
-
-        for strategy in strategies {
-            guard !Task.isCancelled else { return }
-            item.state = .transcoding(0)
-            logger.debug("[\(strategy.name)] starting: '\(item.displayName)'")
-
-            do {
-                try await runFFmpeg(
-                    ffmpeg: ffmpeg,
-                    input: item.fileURL,
-                    output: output,
-                    codecArgs: strategy.codecArgs,
-                    item: item
-                )
-                item.transcodedURL = output
-                item.isAirPlayPrepared = true
-                item.state = .ready
-                logger.debug("[\(strategy.name)] done: '\(item.displayName)'")
-                return
-            } catch {
-                logger.warning("[\(strategy.name)] failed: \(error.localizedDescription)")
-                try? FileManager.default.removeItem(at: output)
-            }
-        }
-
-        guard !Task.isCancelled else { return }
-        item.state = .failed("Could not create an Apple TV compatible HDR10 copy.")
     }
 
     // MARK: - FFmpeg subprocess

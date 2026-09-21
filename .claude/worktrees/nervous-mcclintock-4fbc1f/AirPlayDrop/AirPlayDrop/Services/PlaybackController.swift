@@ -21,7 +21,6 @@ final class PlaybackController {
 
     var onPlaybackFailure: ((MediaItem) -> Void)?
     var onVideoRenderFailure: ((MediaItem) -> Void)?
-    var onAirPlayCompatibilityRequired: ((MediaItem) -> Void)?
     var onEnded: (() -> Void)?
 
     private var endObserver: Any?
@@ -40,12 +39,8 @@ final class PlaybackController {
         externalPlaybackObservation = player.observe(\.isExternalPlaybackActive, options: [.new, .initial]) { [weak self] p, _ in
             let active = p.isExternalPlaybackActive
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.isExternalPlaybackActive = active
+                self?.isExternalPlaybackActive = active
                 logger.debug("isExternalPlaybackActive=\(active)")
-                if active {
-                    self.requestAirPlayConversionIfNeeded()
-                }
             }
         }
         let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
@@ -79,10 +74,6 @@ final class PlaybackController {
 
     func play() {
         guard let item = loadedItem, item.state == .ready else { return }
-        if isExternalPlaybackActive, item.needsAirPlayTranscode {
-            requestAirPlayConversionIfNeeded()
-            return
-        }
         if player.currentItem == nil {
             let playerItem = AVPlayerItem(url: item.playbackURL)
             player.replaceCurrentItem(with: playerItem)
@@ -104,20 +95,6 @@ final class PlaybackController {
     }
 
     // MARK: - Private
-
-    private func requestAirPlayConversionIfNeeded() {
-        guard let item = loadedItem,
-              item.state == .ready,
-              item.needsAirPlayTranscode else { return }
-
-        logger.notice("AirPlay conversion required for '\(item.displayName)'")
-        player.pause()
-        player.replaceCurrentItem(with: nil)
-        removeObservers()
-        currentTime = 0
-        duration = 0
-        onAirPlayCompatibilityRequired?(item)
-    }
 
     private func teardown() {
         player.pause()

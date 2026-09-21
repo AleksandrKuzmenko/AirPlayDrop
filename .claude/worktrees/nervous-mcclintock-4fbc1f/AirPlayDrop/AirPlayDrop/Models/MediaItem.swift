@@ -12,13 +12,11 @@ final class MediaItem: Identifiable, @unchecked Sendable {
     var duration: Double?   // seconds, best-effort
     var state: MediaItemState
     var formatFlags: Set<VideoFormatFlag> = []
-    var isAirPlayPrepared = false
 
-    /// HDR/DV needs an explicitly AirPlay-safe conversion. A generic remux may
-    /// produce an MP4 while retaining Dolby Vision RPU data, an `hev1` sample
-    /// entry, or other stream metadata that Apple TV cannot consume.
+    /// True when the source carries HDR/DV markers that AirPlay typically rejects
+    /// — unless a transcoded SDR copy is already in use.
     var needsAirPlayTranscode: Bool {
-        !isAirPlayPrepared && !formatFlags.isEmpty
+        transcodedURL == nil && !formatFlags.isEmpty
     }
 
     var formatTag: String? {

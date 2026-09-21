@@ -52,9 +52,6 @@ struct MainWindowView: View {
             controller.onVideoRenderFailure = { [weak store] item in
                 store?.retranscode(item, startingAt: 2)
             }
-            controller.onAirPlayCompatibilityRequired = { [weak store] item in
-                store?.forceTranscode(item)
-            }
             controller.onEnded = { [weak store, weak controller] in
                 guard let store, let controller, let current = controller.loadedItem else { return }
                 if let next = store.nextReadyItem(after: current) {
