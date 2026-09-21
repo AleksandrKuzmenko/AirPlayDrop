@@ -6,7 +6,10 @@ struct PlaylistView: View {
     let onRemove: (MediaItem) -> Void
     let onPlay: (MediaItem) -> Void
     let onRetry: (MediaItem) -> Void
-    let onForceTranscode: (MediaItem) -> Void
+    let onPrepare: (MediaItem, PlaybackIntent) -> Void
+    let onCancel: (MediaItem) -> Void
+    let onChooseAudio: (MediaItem, Int?) -> Void
+    let onChooseSubtitle: (MediaItem, Int?) -> Void
 
     var body: some View {
         Group {
@@ -54,9 +57,49 @@ struct PlaylistView: View {
                         Button("Retry Transcode") { onRetry(item) }
                             .disabled(item.state == .loading)
 
-                        Button("Force Transcode for AirPlay") { onForceTranscode(item) }
-                            .disabled(item.state == .loading || item.state == .transcoding(0))
-                            .help("Re-encode to H.264/AAC for Apple TV compatibility")
+                        Menu("Prepare for") {
+                            Button("This Mac") { onPrepare(item, .local) }
+                            Button("Apple TV / AirPlay") { onPrepare(item, .airPlay) }
+                        }
+                        .disabled(item.state == .loading)
+
+                        if case .transcoding = item.state {
+                            Button("Cancel Preparation", role: .destructive) { onCancel(item) }
+                        }
+
+                        if let info = item.mediaInfo, !info.audioTracks.isEmpty {
+                            Menu("Audio Track") {
+                                ForEach(info.audioTracks) { track in
+                                    Button {
+                                        onChooseAudio(item, track.id)
+                                    } label: {
+                                        if item.trackSelection.audioID == track.id {
+                                            Label(track.displayName, systemImage: "checkmark")
+                                        } else { Text(track.displayName) }
+                                    }
+                                }
+                            }
+                        }
+
+                        if let info = item.mediaInfo, !info.subtitleTracks.isEmpty {
+                            Menu("Subtitles") {
+                                Button {
+                                    onChooseSubtitle(item, nil)
+                                } label: {
+                                    if item.trackSelection.subtitleID == nil { Label("None", systemImage: "checkmark") }
+                                    else { Text("None") }
+                                }
+                                ForEach(info.subtitleTracks.filter(\.isTextSubtitle)) { track in
+                                    Button {
+                                        onChooseSubtitle(item, track.id)
+                                    } label: {
+                                        if item.trackSelection.subtitleID == track.id {
+                                            Label(track.displayName, systemImage: "checkmark")
+                                        } else { Text(track.displayName) }
+                                    }
+                                }
+                            }
+                        }
 
                         Divider()
 
@@ -116,11 +159,16 @@ struct PlaylistRowView: View {
                     .progressViewStyle(.linear)
                     .controlSize(.mini)
                     .tint(.orange)
+                if let reason = item.preparationReason {
+                    Text(reason).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                }
             } else if case .failed = item.state, let msg = item.state.errorDescription {
                 Text(msg)
                     .font(.caption2)
                     .foregroundStyle(.red)
                     .lineLimit(2)
+            } else if let reason = item.preparationReason {
+                Text(reason).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
             }
         }
         .padding(.vertical, 3)

@@ -1,18 +1,19 @@
+import AVFoundation
 import Foundation
 import Observation
-import AVFoundation
 
-struct TranscodeRequest: Identifiable {
-    let id = UUID()
-    let item: MediaItem
-    let outputURL: URL
-}
+struct JobTokenRegistry {
+    private var tokens: [UUID: UUID] = [:]
 
-private struct PendingTranscode {
-    let item: MediaItem
-    let startingAt: Int
-    let outputURL: URL
-    let continuation: CheckedContinuation<Bool, Never>
+    mutating func begin(itemID: UUID) -> UUID {
+        let token = UUID()
+        tokens[itemID] = token
+        return token
+    }
+
+    mutating func invalidate(itemID: UUID) { tokens.removeValue(forKey: itemID) }
+    mutating func invalidateAll() { tokens.removeAll() }
+    func isCurrent(_ token: UUID, itemID: UUID) -> Bool { tokens[itemID] == token }
 }
 
 @Observable
@@ -20,207 +21,207 @@ private struct PendingTranscode {
 final class PlaylistStore {
     var items: [MediaItem] = []
     var selectedID: UUID?
-    var transcodeRequest: TranscodeRequest?
 
     var selectedItem: MediaItem? {
-        guard let id = selectedID else { return nil }
-        return items.first { $0.id == id }
+        guard let selectedID else { return nil }
+        return items.first { $0.id == selectedID }
     }
 
     private var processTasks: [UUID: Task<Void, Never>] = [:]
-    private var transcodeQueue: [PendingTranscode] = []
-
-    // MARK: - Mutations
+    private var jobTokens = JobTokenRegistry()
 
     func add(urls: [URL]) {
-        for url in urls {
-            guard !items.contains(where: {
-                $0.fileURL.standardizedFileURL == url.standardizedFileURL
-            }) else { continue }
-
+        for url in urls where !items.contains(where: { $0.fileURL.standardizedFileURL == url.standardizedFileURL }) {
             let item = MediaItem(fileURL: url)
             items.append(item)
-            processTasks[item.id] = processItem(item)
+            launchMetadataJob(for: item)
         }
     }
 
     func remove(_ item: MediaItem) {
-        processTasks[item.id]?.cancel()
-        processTasks.removeValue(forKey: item.id)
-        cancelPendingTranscode(for: item.id)
+        cancel(item)
         items.removeAll { $0.id == item.id }
-        if selectedID == item.id {
-            selectedID = items.first { $0.state == .ready }?.id
-        }
+        if selectedID == item.id { selectedID = items.first { $0.state == .ready }?.id }
     }
 
     func removeAll() {
-        for (_, task) in processTasks { task.cancel() }
+        processTasks.values.forEach { $0.cancel() }
         processTasks.removeAll()
-        for pending in transcodeQueue { pending.continuation.resume(returning: false) }
-        transcodeQueue.removeAll()
-        transcodeRequest = nil
+        jobTokens.invalidateAll()
         items.removeAll()
         selectedID = nil
-    }
-
-    /// Resolves any queued transcode-confirmation continuations for this item with `false`,
-    /// and advances the visible alert to the next queued request (or dismisses it).
-    private func cancelPendingTranscode(for itemID: UUID) {
-        let wasFirstForThisItem = transcodeQueue.first?.item.id == itemID
-        let (pendingForItem, rest) = transcodeQueue.reduce(into: ([PendingTranscode](), [PendingTranscode]())) { acc, p in
-            if p.item.id == itemID { acc.0.append(p) } else { acc.1.append(p) }
-        }
-        transcodeQueue = rest
-        for p in pendingForItem { p.continuation.resume(returning: false) }
-        if wasFirstForThisItem {
-            transcodeRequest = transcodeQueue.first.map {
-                TranscodeRequest(item: $0.item, outputURL: $0.outputURL)
-            }
-        }
     }
 
     func move(fromOffsets source: IndexSet, toOffset destination: Int) {
         items.move(fromOffsets: source, toOffset: destination)
     }
 
-    func select(_ item: MediaItem) {
-        selectedID = item.id
-    }
+    func select(_ item: MediaItem) { selectedID = item.id }
 
     func nextReadyItem(after item: MediaItem) -> MediaItem? {
-        guard let idx = items.firstIndex(where: { $0.id == item.id }) else { return nil }
-        return items[(idx + 1)...].first { $0.state == .ready }
+        guard let index = items.firstIndex(where: { $0.id == item.id }), index + 1 < items.endIndex else { return nil }
+        return items[(index + 1)...].first { $0.state == .ready }
     }
 
-    /// Called when AVPlayer reports a runtime failure — re-runs the transcode pipeline
-    /// starting at `startingAt` to skip strategies already known not to work.
-    func retranscode(_ item: MediaItem, startingAt: Int) {
-        processTasks[item.id]?.cancel()
-        let task = Task { [weak self] in
-            guard let self else { return }
-            let outputURL = TranscodeService.outputURL(for: item.fileURL)
-
-            if startingAt < 2 {
-                await TranscodeService.process(item: item, startingAt: startingAt, endBefore: 2)
-            }
-
-            if item.state != .ready {
-                let confirmed = await self.requestTranscodeConfirmation(
-                    for: item, startingAt: 2, outputURL: outputURL)
-                if confirmed {
-                    await TranscodeService.process(item: item, startingAt: 2)
-                }
-            }
-
-            if self.selectedID == nil, item.state == .ready {
-                self.selectedID = item.id
-            }
-        }
-        processTasks[item.id] = task
-    }
-
-    /// Wipes any cached transcode output and re-runs the full pipeline from scratch.
     func retry(_ item: MediaItem) {
-        processTasks[item.id]?.cancel()
         item.transcodedURL = nil
         item.isAirPlayPrepared = false
-        item.state = .idle
-        processTasks[item.id] = processItem(item)
+        item.preparationReason = nil
+        launchMetadataJob(for: item)
     }
 
-    /// Forces a full H.264/AAC re-encode even if the source is natively playable.
-    /// Use when AirPlay external playback rejects the native codec.
-    func forceTranscode(_ item: MediaItem) {
-        processTasks[item.id]?.cancel()
+    func prepare(_ item: MediaItem, for intent: PlaybackIntent) {
+        let fallback: MediaItemState = item.transcodedURL != nil || item.state == .ready ? .ready : .unsupported
+        launchPreparationJob(for: item, intent: intent, fallbackState: fallback)
+    }
+
+    func forceTranscode(_ item: MediaItem) { prepare(item, for: .airPlay) }
+
+    func retranscode(_ item: MediaItem, for intent: PlaybackIntent) {
         item.transcodedURL = nil
         item.isAirPlayPrepared = false
-        item.state = .idle
-        processTasks[item.id] = Task { [weak self] in
-            guard let self else { return }
-            let outputURL = TranscodeService.outputURL(for: item.fileURL)
-            let confirmed = await self.requestTranscodeConfirmation(
-                for: item, startingAt: 2, outputURL: outputURL)
-            if confirmed {
-                await TranscodeService.processForAirPlay(item: item)
-                if item.state == .ready {
-                    let asset = AVURLAsset(url: item.playbackURL)
-                    item.formatFlags = await VideoFormatProbe.inspect(asset)
-                }
-            } else {
-                item.state = .ready
-            }
+        launchPreparationJob(for: item, intent: intent, fallbackState: .failed("Playback failed; conversion was cancelled."))
+    }
+
+    func cancel(_ item: MediaItem) {
+        processTasks[item.id]?.cancel()
+        processTasks.removeValue(forKey: item.id)
+        jobTokens.invalidate(itemID: item.id)
+        if case .transcoding = item.state {
+            item.state = item.transcodedURL == nil ? .unsupported : .ready
+            item.preparationReason = "Preparation cancelled."
         }
     }
 
-    // MARK: - Processing pipeline
+    func chooseAudio(_ trackID: Int?, for item: MediaItem) {
+        item.trackSelection.audioID = trackID
+        invalidatePreparedArtifact(item)
+    }
 
-    private func processItem(_ item: MediaItem) -> Task<Void, Never> {
-        Task { [weak self] in
-            guard let self else { return }
+    func chooseSubtitle(_ trackID: Int?, for item: MediaItem) {
+        item.trackSelection.subtitleID = trackID
+        item.trackSelection.subtitlePolicy = trackID == nil ? .omit : .includeSelected
+        invalidatePreparedArtifact(item)
+    }
 
+    private func invalidatePreparedArtifact(_ item: MediaItem) {
+        if item.transcodedURL != nil {
+            item.transcodedURL = nil
+            item.isAirPlayPrepared = false
+            item.preparationReason = "Track selection changed; prepare the video again."
+        }
+    }
+
+    private func beginJob(for item: MediaItem) -> (token: UUID, previous: Task<Void, Never>?) {
+        let previous = processTasks[item.id]
+        previous?.cancel()
+        return (jobTokens.begin(itemID: item.id), previous)
+    }
+
+    private func isCurrent(_ token: UUID, for item: MediaItem) -> Bool {
+        jobTokens.isCurrent(token, itemID: item.id) && items.contains { $0.id == item.id }
+    }
+
+    private func finish(_ token: UUID, for item: MediaItem) {
+        guard isCurrent(token, for: item) else { return }
+        processTasks.removeValue(forKey: item.id)
+        jobTokens.invalidate(itemID: item.id)
+    }
+
+    private func launchMetadataJob(for item: MediaItem) {
+        let job = beginJob(for: item)
+        let token = job.token
+        item.state = .loading
+        processTasks[item.id] = Task { [weak self, weak item] in
+            if let previous = job.previous { await previous.value }
+            guard let self, let item else { return }
             await MetadataLoader.load(item: item)
+            guard self.isCurrent(token, for: item), !Task.isCancelled else { return }
+
+            if let installation = FFmpegLocator.locate(),
+               let info = try? await FFprobeService.probe(item.fileURL, using: installation) {
+                guard self.isCurrent(token, for: item), !Task.isCancelled else { return }
+                item.mediaInfo = info
+                item.duration = item.duration ?? info.duration
+                item.trackSelection = FFprobeService.defaultSelection(from: info)
+            }
 
             if case .unsupported = item.state {
-                let outputURL = TranscodeService.outputURL(for: item.fileURL)
+                self.finish(token, for: item)
+                self.launchPreparationJob(for: item, intent: .local, fallbackState: .unsupported)
+                return
+            }
+            if item.state == .ready {
+                item.isAirPlayPrepared = await VideoFormatProbe.isAirPlayPrepared(AVURLAsset(url: item.playbackURL))
+                if self.selectedID == nil { self.selectedID = item.id }
+            }
+            self.finish(token, for: item)
+        }
+    }
 
-                let cached = await MediaArtifactValidator.validateCached(outputURL, source: item.fileURL)
-                if cached.isValid {
-                    item.transcodedURL = outputURL
+    private func launchPreparationJob(for item: MediaItem, intent: PlaybackIntent, fallbackState: MediaItemState) {
+        let job = beginJob(for: item)
+        let token = job.token
+        item.playbackIntent = intent
+        item.preparationReason = intent == .airPlay ? "Inspecting Apple TV compatibility…" : "Inspecting media compatibility…"
+        item.state = .transcoding(0)
+
+        processTasks[item.id] = Task { [weak self, weak item] in
+            if let previous = job.previous { await previous.value }
+            guard let self, let item else { return }
+            do {
+                guard let installation = FFmpegLocator.locate() else { throw TranscodeError.ffmpegNotFound }
+                let info: MediaInfo
+                if let existing = item.mediaInfo { info = existing }
+                else { info = try await FFprobeService.probe(item.fileURL, using: installation) }
+                guard self.isCurrent(token, for: item) else { return }
+                item.mediaInfo = info
+                if item.trackSelection.audioID == nil && info.hasAudio {
+                    item.trackSelection = FFprobeService.defaultSelection(from: info)
+                }
+                let plan = TranscodePlanner.plan(info: info, intent: intent,
+                    selectedAudioID: item.trackSelection.audioID)
+                item.preparationReason = plan.reason
+
+                var cachedURL: URL?
+                for candidate in OutputReservation.existingArtifacts(for: item.fileURL) {
+                    let validation = await MediaArtifactValidator.validateCached(candidate, source: item.fileURL,
+                        expectedSelectedAudioID: item.trackSelection.audioID)
+                    guard self.isCurrent(token, for: item), !Task.isCancelled else { return }
+                    if validation.isValid { cachedURL = candidate; break }
+                }
+                if let cachedURL {
+                    item.transcodedURL = cachedURL
+                    item.isAirPlayPrepared = intent == .airPlay
+                    item.preparationReason = "Reused a validated prepared copy."
                     item.state = .ready
                 } else {
-                    await TranscodeService.process(item: item, startingAt: 0, endBefore: 2)
-
-                    if item.state != .ready {
-                        let confirmed = await self.requestTranscodeConfirmation(
-                            for: item, startingAt: 2, outputURL: outputURL)
-                        if confirmed {
-                            await TranscodeService.process(item: item, startingAt: 2)
+                    let artifact = try await TranscodeService.prepare(input: item.fileURL, info: info,
+                        selection: item.trackSelection, intent: intent) { [weak self, weak item] progress in
+                            Task { @MainActor in
+                                guard let self, let item, self.isCurrent(token, for: item) else { return }
+                                if case .transcoding(let old) = item.state {
+                                    item.state = .transcoding(max(old, progress))
+                                }
+                            }
                         }
-                    }
+                    guard self.isCurrent(token, for: item), !Task.isCancelled else { return }
+                    item.transcodedURL = artifact.url == item.fileURL ? nil : artifact.url
+                    item.isAirPlayPrepared = artifact.isAirPlayPrepared
+                    item.preparationReason = artifact.reason
+                    item.state = .ready
                 }
+                if self.selectedID == nil { self.selectedID = item.id }
+            } catch is CancellationError {
+                guard self.isCurrent(token, for: item) else { return }
+                item.state = fallbackState
+                item.preparationReason = "Preparation cancelled."
+            } catch {
+                guard self.isCurrent(token, for: item) else { return }
+                item.state = .failed(error.localizedDescription)
+                item.preparationReason = nil
             }
-
-            // Re-probe the playback URL — remux preserves HDR/DV streams from the source,
-            // so the flags need to reflect the file AVPlayer is actually going to hand to AirPlay.
-            if item.state == .ready {
-                let asset = AVURLAsset(url: item.playbackURL)
-                item.formatFlags = await VideoFormatProbe.inspect(asset)
-                item.isAirPlayPrepared = await VideoFormatProbe.isAirPlayPrepared(asset)
-            }
-
-            if self.selectedID == nil, item.state == .ready {
-                self.selectedID = item.id
-            }
-        }
-    }
-
-    // MARK: - Transcode confirmation
-
-    private func requestTranscodeConfirmation(
-        for item: MediaItem,
-        startingAt: Int,
-        outputURL: URL
-    ) async -> Bool {
-        await withCheckedContinuation { continuation in
-            let pending = PendingTranscode(
-                item: item, startingAt: startingAt,
-                outputURL: outputURL, continuation: continuation)
-            transcodeQueue.append(pending)
-            if transcodeQueue.count == 1 {
-                transcodeRequest = TranscodeRequest(item: item, outputURL: outputURL)
-            }
-        }
-    }
-
-    func confirmTranscode(_ confirmed: Bool) {
-        guard let current = transcodeQueue.first else { return }
-        transcodeQueue.removeFirst()
-        transcodeRequest = nil
-        current.continuation.resume(returning: confirmed)
-
-        if let next = transcodeQueue.first {
-            transcodeRequest = TranscodeRequest(item: next.item, outputURL: next.outputURL)
+            self.finish(token, for: item)
         }
     }
 }

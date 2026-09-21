@@ -17,6 +17,9 @@ struct AirPlayDropApp: App {
                 .keyboardShortcut("o", modifiers: .command)
             }
         }
+        Settings {
+            DependencySettingsView()
+        }
     }
 }
 

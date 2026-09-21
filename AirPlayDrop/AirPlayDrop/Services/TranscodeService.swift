@@ -3,323 +3,217 @@ import os
 
 private let logger = Logger(subsystem: "com.airplaydrop", category: "TranscodeService")
 
-// MARK: - Errors
-
 enum TranscodeError: LocalizedError {
     case ffmpegNotFound
-    case processFailed(Int32)
+    case noVideo
+    case noAudioSelection
+    case processFailed(Int32, String)
     case invalidOutput(String)
+    case allStrategiesFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .ffmpegNotFound:
-            return "FFmpeg not found. Install with: brew install ffmpeg"
-        case .processFailed(let code):
-            return "FFmpeg exited with code \(code). Check Console for details."
-        case .invalidOutput(let reason):
-            return "Generated media failed validation: \(reason)"
+            return "FFmpeg and FFprobe were not found. Install them with Homebrew or choose their bin directory in Settings."
+        case .noVideo: return "No video track was found in the source."
+        case .noAudioSelection: return "The source contains audio, but no audio track is selected."
+        case .processFailed(let code, let details):
+            return "FFmpeg exited with code \(code). \(details)"
+        case .invalidOutput(let reason): return "Generated media failed validation: \(reason)"
+        case .allStrategiesFailed(let details): return "No conversion strategy succeeded. \(details)"
         }
     }
 }
 
-// MARK: - Service
+struct PreparedArtifact: Sendable {
+    let url: URL
+    let strategy: ConversionStrategy
+    let reason: String
+    let isAirPlayPrepared: Bool
+}
 
-struct TranscodeService {
+private final class RunningProcess: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
 
-    private static let knownPaths = [
-        "/opt/homebrew/bin/ffmpeg",
-        "/usr/local/bin/ffmpeg",
-        "/usr/bin/ffmpeg",
-    ]
-
-    static func findFFmpeg() -> URL? {
-        knownPaths
-            .map { URL(fileURLWithPath: $0) }
-            .first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    func install(_ process: Process) {
+        lock.lock(); defer { lock.unlock() }
+        self.process = process
+        if cancelled { process.terminate() }
     }
 
-    /// Returns the first conventional output path. Actual jobs reserve a unique path and never
-    /// overwrite this value; this method remains for display and compatibility with older callers.
+    func terminate() {
+        lock.lock(); defer { lock.unlock() }
+        cancelled = true
+        if process?.isRunning == true { process?.terminate() }
+    }
+
+    var wasCancelled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return cancelled
+    }
+}
+
+private final class BoundedDiagnostics: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = ""
+    private let limit = 16_384
+
+    func append(_ text: String) {
+        lock.lock(); defer { lock.unlock() }
+        value.append(text)
+        if value.utf8.count > limit { value = String(value.suffix(limit)) }
+    }
+
+    func snapshot() -> String {
+        lock.lock(); defer { lock.unlock() }
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+enum TranscodeService {
     static func outputURL(for input: URL) -> URL {
-        let dir = input.deletingLastPathComponent()
-        let stem = input.deletingPathExtension().lastPathComponent
-        return dir.appendingPathComponent(stem + "_airplay.mp4")
+        input.deletingLastPathComponent()
+            .appendingPathComponent(input.deletingPathExtension().lastPathComponent + "_airplay.mp4")
     }
 
-    // MARK: - Main entry point (called from @MainActor context)
+    static func streamArguments(selection: TrackSelection, sourceHasAudio: Bool) throws -> [String] {
+        if sourceHasAudio && selection.audioID == nil { throw TranscodeError.noAudioSelection }
+        var arguments = ["-map", "0:v:0"]
+        if let audioID = selection.audioID { arguments += ["-map", "0:\(audioID)"] }
+        if selection.subtitlePolicy == .includeSelected, let subtitleID = selection.subtitleID {
+            arguments += ["-map", "0:\(subtitleID)"]
+        }
+        arguments += ["-map_metadata", "-1", "-map_chapters", "-1", "-dn"]
+        if selection.subtitlePolicy == .omit || selection.subtitleID == nil { arguments.append("-sn") }
+        return arguments
+    }
 
-    /// Tries strategies in order from `startingAt` up to (not including) `endBefore`.
-    /// Marks the item `.ready` on first success.
-    /// When `endBefore` is less than the total strategy count the item is NOT marked `.failed`
-    /// on exhaustion — the caller is expected to try remaining strategies after (e.g. after
-    /// asking the user for permission to do a slow video re-encode).
-    @MainActor
-    static func process(item: MediaItem, startingAt: Int = 0, endBefore: Int = .max) async {
-        guard let ffmpeg = findFFmpeg() else {
-            item.state = .failed(TranscodeError.ffmpegNotFound.localizedDescription)
-            return
+    static func ffmpegArguments(input: URL, output: URL, step: ConversionStep,
+                                selection: TrackSelection, sourceHasAudio: Bool) throws -> [String] {
+        var arguments = ["-nostats", "-progress", "pipe:2", "-i", input.path]
+        arguments += try streamArguments(selection: selection, sourceHasAudio: sourceHasAudio)
+        arguments += step.videoArguments
+        if selection.audioID != nil { arguments += step.audioArguments }
+        if selection.subtitlePolicy == .includeSelected, selection.subtitleID != nil {
+            arguments += ["-c:s", "mov_text"]
+        }
+        arguments += ["-movflags", "+faststart", output.path]
+        return arguments
+    }
+
+    static func prepare(input: URL, info: MediaInfo, selection: TrackSelection,
+                        intent: PlaybackIntent, progress: @escaping @Sendable (Double) -> Void) async throws -> PreparedArtifact {
+        guard info.videoCodec != nil else { throw TranscodeError.noVideo }
+        guard let installation = FFmpegLocator.locate() else { throw TranscodeError.ffmpegNotFound }
+        let plan = TranscodePlanner.plan(info: info, intent: intent, selectedAudioID: selection.audioID)
+        if plan.steps.isEmpty {
+            return PreparedArtifact(url: input, strategy: .directPlay, reason: plan.reason, isAirPlayPrepared: false)
         }
 
-        let reservation: OutputReservation
-        do { reservation = try OutputReservation.reserve(for: item.fileURL) }
-        catch { item.state = .failed("Could not reserve an output file: \(error.localizedDescription)"); return }
+        let reservation = try OutputReservation.reserve(for: input)
+        var failures: [String] = []
+        defer { try? FileManager.default.removeItem(at: reservation.temporary) }
 
-        // Strategy cascade — fastest / highest quality first.
-        //
-        //  remux           — repackage unchanged streams into MP4 container.
-        //                    Instant, lossless. Fails when a codec (e.g. DTS) is
-        //                    not legal inside MP4.
-        //
-        //  audio-transcode — copy video track, re-encode audio to AAC.
-        //                    Fast. Handles DTS / TrueHD / E-AC3 / Opus.
-        //
-        //  full-transcode  — re-encode both video (H.264) and audio (AAC).
-        //                    Slow. Handles anything ffmpeg can decode.
-
-        let strategies: [(name: String, codecArgs: [String])] = [
-            // 0: remux — repackage unchanged streams, instant, lossless.
-            ("remux",                ["-c", "copy"]),
-            // 1: audio-transcode — copy video, re-encode audio to AAC. Handles DTS/TrueHD/EAC3.
-            ("audio-transcode",      ["-c:v", "copy", "-c:a", "aac", "-ac:a", "2",
-                                      "-b:a", "192k"]),
-            // 2: hw-video-transcode — VideoToolbox H.264 (GPU/media engine, fast).
-            //    Handles HEVC/VP9/AV1 that VideoToolbox can't decode for playback.
-            ("hw-video-transcode",   ["-c:v", "h264_videotoolbox", "-b:v", "5000k",
-                                      "-c:a", "aac", "-ac:a", "2", "-b:a", "192k"]),
-            // 3: sw-video-transcode — libx264 software fallback, handles anything FFmpeg decodes.
-            ("sw-video-transcode",   ["-c:v", "libx264", "-preset", "fast", "-crf", "20",
-                                      "-c:a", "aac", "-ac:a", "2", "-b:a", "192k"]),
-        ]
-
-        let start = min(startingAt, strategies.count)
-        let end   = min(endBefore,   strategies.count)
-        for strategy in strategies[start..<end] {
-            guard !Task.isCancelled else { return }
-
-            item.state = .transcoding(0.0)
-            logger.debug("[\(strategy.name)] starting: '\(item.displayName)'")
-
+        for step in plan.steps {
+            try Task.checkCancellation()
+            progress(0)
+            logger.notice("[\(step.strategy.rawValue)] \(step.reason)")
             do {
-                try await runFFmpeg(
-                    ffmpeg: ffmpeg,
-                    input: item.fileURL,
-                    output: reservation.temporary,
-                    codecArgs: strategy.codecArgs,
-                    item: item
-                )
-                let validation = await MediaArtifactValidator.validate(reservation.temporary)
-                guard validation.isValid else { throw TranscodeError.invalidOutput(validation.reason ?? "Output validation failed") }
+                let arguments = try ffmpegArguments(input: input, output: reservation.temporary,
+                    step: step, selection: selection, sourceHasAudio: info.hasAudio)
+                try await runProcess(executable: installation.ffmpeg, arguments: arguments,
+                    duration: info.duration, progress: progress)
+                try Task.checkCancellation()
+                let validation = await MediaArtifactValidator.validate(reservation.temporary,
+                    sourceHadAudio: info.hasAudio, expectedDuration: info.duration, requiresHVC1: step.requiresHVC1)
+                guard validation.isValid else {
+                    throw TranscodeError.invalidOutput(validation.reason ?? "Unknown validation error")
+                }
                 try FileManager.default.moveItem(at: reservation.temporary, to: reservation.destination)
                 do {
-                    try MediaArtifactValidator.writeManifest(source: item.fileURL, artifact: reservation.destination, validation: validation)
+                    try MediaArtifactValidator.writeManifest(source: input, artifact: reservation.destination,
+                        sourceHadAudio: info.hasAudio, selectedAudioID: selection.audioID,
+                        expectedDuration: info.duration, requiresHVC1: step.requiresHVC1)
                 } catch {
                     try? FileManager.default.removeItem(at: reservation.destination)
                     throw error
                 }
-                item.transcodedURL = reservation.destination
-                item.state = .ready
-                logger.debug("[\(strategy.name)] done: '\(item.displayName)'")
-                return
+                progress(1)
+                return PreparedArtifact(url: reservation.destination, strategy: step.strategy,
+                    reason: step.reason, isAirPlayPrepared: intent == .airPlay)
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
-                logger.warning("[\(strategy.name)] failed: \(error.localizedDescription)")
+                failures.append("\(step.strategy.rawValue): \(error.localizedDescription)")
+                logger.warning("[\(step.strategy.rawValue)] failed: \(error.localizedDescription)")
                 try? FileManager.default.removeItem(at: reservation.temporary)
             }
         }
-
-        guard !Task.isCancelled else { return }
-        // Only mark permanently failed when we've run through all remaining strategies.
-        // When endBefore limits the range, the caller will handle what to try next.
-        if end >= strategies.count {
-            item.state = .failed("No transcode strategy succeeded. Check Console for details.")
-        }
+        throw TranscodeError.allStrategiesFailed(failures.suffix(2).joined(separator: " "))
     }
 
-    /// Produces an Apple TV friendly HDR10 MP4 from an HDR/Dolby Vision source.
-    ///
-    /// The fast path keeps the HEVC Main 10 HDR10-compatible base layer and removes
-    /// Dolby Vision RPU NAL units (type 62). If the source cannot be remuxed, the
-    /// fallback re-encodes to HEVC Main 10 with VideoToolbox while preserving the
-    /// BT.2020/PQ HDR signalling.
-    @MainActor
-    static func processForAirPlay(item: MediaItem) async {
-        guard let ffmpeg = findFFmpeg() else {
-            item.state = .failed(TranscodeError.ffmpegNotFound.localizedDescription)
-            return
-        }
+    static func runProcess(executable: URL, arguments: [String], duration: Double?,
+                           progress: @escaping @Sendable (Double) -> Void) async throws {
+        let holder = RunningProcess()
+        let diagnostics = BoundedDiagnostics()
+        try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let process = Process()
+                let pipe = Pipe()
+                process.executableURL = executable
+                process.arguments = arguments
+                process.standardOutput = FileHandle.nullDevice
+                process.standardError = pipe
+                holder.install(process)
 
-        let reservation: OutputReservation
-        do { reservation = try OutputReservation.reserve(for: item.fileURL) }
-        catch { item.state = .failed("Could not reserve an output file: \(error.localizedDescription)"); return }
-
-        let streamArgs = [
-            "-map", "0:v:0",
-            "-map", "0:a:0?",
-            "-map_metadata", "-1",
-            "-map_chapters", "-1",
-            "-sn", "-dn",
-        ]
-        let strategies: [(name: String, codecArgs: [String])] = [
-            (
-                "airplay-hdr10-remux",
-                streamArgs + [
-                    "-c:v", "copy",
-                    "-bsf:v", "filter_units=remove_types=62",
-                    "-tag:v", "hvc1",
-                    "-c:a", "aac", "-ac:a", "2", "-b:a", "192k",
-                ]
-            ),
-            (
-                "airplay-hdr10-videotoolbox",
-                streamArgs + [
-                    "-c:v", "hevc_videotoolbox",
-                    "-profile:v", "main10",
-                    "-pix_fmt", "p010le",
-                    "-b:v", "12000k",
-                    "-tag:v", "hvc1",
-                    "-c:a", "aac", "-ac:a", "2", "-b:a", "192k",
-                ]
-            ),
-        ]
-
-        for strategy in strategies {
-            guard !Task.isCancelled else { return }
-            item.state = .transcoding(0)
-            logger.debug("[\(strategy.name)] starting: '\(item.displayName)'")
-
-            do {
-                try await runFFmpeg(
-                    ffmpeg: ffmpeg,
-                    input: item.fileURL,
-                    output: reservation.temporary,
-                    codecArgs: strategy.codecArgs,
-                    item: item
-                )
-                let validation = await MediaArtifactValidator.validate(reservation.temporary)
-                guard validation.isValid else { throw TranscodeError.invalidOutput(validation.reason ?? "Output validation failed") }
-                try FileManager.default.moveItem(at: reservation.temporary, to: reservation.destination)
-                do {
-                    try MediaArtifactValidator.writeManifest(source: item.fileURL, artifact: reservation.destination, validation: validation)
-                } catch {
-                    try? FileManager.default.removeItem(at: reservation.destination)
-                    throw error
-                }
-                item.transcodedURL = reservation.destination
-                item.isAirPlayPrepared = true
-                item.state = .ready
-                logger.debug("[\(strategy.name)] done: '\(item.displayName)'")
-                return
-            } catch {
-                logger.warning("[\(strategy.name)] failed: \(error.localizedDescription)")
-                try? FileManager.default.removeItem(at: reservation.temporary)
-            }
-        }
-
-        guard !Task.isCancelled else { return }
-        item.state = .failed("Could not create an Apple TV compatible HDR10 copy.")
-    }
-
-    // MARK: - FFmpeg subprocess
-
-    private static func runFFmpeg(
-        ffmpeg: URL,
-        input: URL,
-        output: URL,
-        codecArgs: [String],
-        item: MediaItem
-    ) async throws {
-        // -nostats     : suppress the inline stats overlay (uses \r — hard to parse)
-        // -progress p:2: write structured key=value progress to stderr once per second
-        let argv: [String] = [
-            "-nostats", "-progress", "pipe:2",
-            "-i", input.path,
-        ] + codecArgs + ["-movflags", "+faststart", output.path]
-
-        logger.debug("exec: ffmpeg \(argv.joined(separator: " "))")
-
-        let process = Process()
-        process.executableURL = ffmpeg
-        process.arguments = argv
-        process.standardOutput = FileHandle.nullDevice
-
-        let errPipe = Pipe()
-        process.standardError = errPipe
-
-        let effectiveDuration = item.duration ?? 0
-
-        // Wire up real-time progress via readabilityHandler (background thread → @MainActor).
-        errPipe.fileHandleForReading.readabilityHandler = { [weak item] handle in
-            let data = handle.availableData
-            guard !data.isEmpty,
-                  let text = String(data: data, encoding: .utf8) else { return }
-
-            for line in text.components(separatedBy: .newlines) {
-                // Fallback: grab total duration from FFmpeg's "  Duration: HH:MM:SS.ss, ..."
-                // header line when AVFoundation couldn't provide it.
-                guard effectiveDuration > 0, let secs = parseOutTime(line) else { continue }
-                let progress = min(secs / effectiveDuration, 0.99)
-                Task { @MainActor [weak item] in
-                    if case .transcoding = item?.state {
-                        item?.state = .transcoding(progress)
+                pipe.fileHandleForReading.readabilityHandler = { handle in
+                    let data = handle.availableData
+                    guard !data.isEmpty else { return }
+                    let text = String(decoding: data, as: UTF8.self)
+                    diagnostics.append(text)
+                    guard let duration, duration > 0 else { return }
+                    for line in text.split(whereSeparator: \.isNewline) {
+                        if let seconds = parseOutTime(String(line)) {
+                            progress(min(max(seconds / duration, 0), 0.99))
+                        }
                     }
                 }
-            }
-        }
-
-        // Launch and await termination. withTaskCancellationHandler ensures the FFmpeg
-        // subprocess is killed if the Swift Task is cancelled — prevents two concurrent
-        // FFmpeg processes from writing to the same output file.
-        let exitCode: Int32 = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                process.terminationHandler = { p in
-                    errPipe.fileHandleForReading.readabilityHandler = nil
-                    continuation.resume(returning: p.terminationStatus)
+                process.terminationHandler = { process in
+                    pipe.fileHandleForReading.readabilityHandler = nil
+                    let tail = pipe.fileHandleForReading.readDataToEndOfFile()
+                    if !tail.isEmpty { diagnostics.append(String(decoding: tail, as: UTF8.self)) }
+                    if holder.wasCancelled {
+                        continuation.resume(throwing: CancellationError())
+                    } else if process.terminationStatus == 0 {
+                        continuation.resume()
+                    } else {
+                        continuation.resume(throwing: TranscodeError.processFailed(process.terminationStatus,
+                            diagnostics.snapshot()))
+                    }
                 }
                 do {
                     try process.run()
-                } catch {
-                    errPipe.fileHandleForReading.readabilityHandler = nil
-                    continuation.resume(throwing: error)
+                    if holder.wasCancelled { holder.terminate() }
                 }
+                catch { pipe.fileHandleForReading.readabilityHandler = nil; continuation.resume(throwing: error) }
             }
-        } onCancel: {
-            process.terminate()
-        }
-
-        guard exitCode == 0 else {
-            logger.error("FFmpeg exited \(exitCode)")
-            throw TranscodeError.processFailed(exitCode)
-        }
+        }, onCancel: {
+            holder.terminate()
+        })
     }
 
-    // MARK: - Progress parsing
-
-    /// Parses `  Duration: HH:MM:SS.ss, ...` from FFmpeg's input-info header.
-    private static func parseDuration(_ line: String) -> Double? {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.hasPrefix("Duration:") else { return nil }
-        let ts = trimmed.dropFirst("Duration:".count)
-            .trimmingCharacters(in: .whitespaces)
-            .prefix(while: { $0 != "," && !$0.isWhitespace })
-        let parts = ts.split(separator: ":")
-        guard parts.count == 3,
-              let h = Double(parts[0]),
-              let m = Double(parts[1]),
-              let s = Double(parts[2]) else { return nil }
-        let total = h * 3600 + m * 60 + s
-        return total > 0 ? total : nil
-    }
-
-    /// Parses `out_time=HH:MM:SS.ssssss` from an FFmpeg `-progress` line.
-    private static func parseOutTime(_ line: String) -> Double? {
+    static func parseOutTime(_ line: String) -> Double? {
+        if line.hasPrefix("out_time_us="), let microseconds = Double(line.dropFirst("out_time_us=".count)) {
+            return microseconds / 1_000_000
+        }
+        if line.hasPrefix("out_time_ms="), let microseconds = Double(line.dropFirst("out_time_ms=".count)) {
+            return microseconds / 1_000_000
+        }
         guard line.hasPrefix("out_time=") else { return nil }
-        let ts = line.dropFirst("out_time=".count)
-            .trimmingCharacters(in: .whitespacesAndNewlines) // strip \r if present
-        let parts = ts.split(separator: ":")
-        guard parts.count == 3,
-              let h = Double(parts[0]),
-              let m = Double(parts[1]),
-              let s = Double(parts[2]) else { return nil }
-        let total = h * 3600 + m * 60 + s
-        return total > 0 ? total : nil
+        let fields = line.dropFirst("out_time=".count).split(separator: ":")
+        guard fields.count == 3, let h = Double(fields[0]), let m = Double(fields[1]), let s = Double(fields[2]) else { return nil }
+        return h * 3600 + m * 60 + s
     }
 }

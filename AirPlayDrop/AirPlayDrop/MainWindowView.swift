@@ -5,6 +5,7 @@ struct MainWindowView: View {
     @State private var store = PlaylistStore()
     @State private var controller = PlaybackController()
     @State private var isDropTargeted = false
+    @State private var showDependencySettings = false
 
     var body: some View {
         HSplitView {
@@ -14,7 +15,10 @@ struct MainWindowView: View {
                 onRemove: remove,
                 onPlay: play,
                 onRetry: { store.retry($0) },
-                onForceTranscode: { store.forceTranscode($0) }
+                onPrepare: { store.prepare($0, for: $1) },
+                onCancel: { store.cancel($0) },
+                onChooseAudio: { store.chooseAudio($1, for: $0) },
+                onChooseSubtitle: { store.chooseSubtitle($1, for: $0) }
             )
             .frame(minWidth: 220, idealWidth: 280, maxWidth: 380)
 
@@ -46,17 +50,18 @@ struct MainWindowView: View {
             controller.prepare(item: store.selectedItem)
         }
         .task {
-            controller.onPlaybackFailure = { [weak store] item in
-                store?.retranscode(item, startingAt: 1)
+            weak let playbackController = controller
+            controller.onPlaybackFailure = { [store] item in
+                store.retranscode(item, for: .local)
             }
-            controller.onVideoRenderFailure = { [weak store] item in
-                store?.retranscode(item, startingAt: 2)
+            controller.onVideoRenderFailure = { [store] item in
+                store.retranscode(item, for: .local)
             }
-            controller.onAirPlayCompatibilityRequired = { [weak store] item in
-                store?.forceTranscode(item)
+            controller.onAirPlayCompatibilityRequired = { [store] item in
+                store.prepare(item, for: .airPlay)
             }
-            controller.onEnded = { [weak store, weak controller] in
-                guard let store, let controller, let current = controller.loadedItem else { return }
+            controller.onEnded = { [store] in
+                guard let controller = playbackController, let current = controller.loadedItem else { return }
                 if let next = store.nextReadyItem(after: current) {
                     store.selectedID = next.id
                     controller.prepare(item: next)
@@ -69,25 +74,7 @@ struct MainWindowView: View {
         .onReceive(NotificationCenter.default.publisher(for: .openFileRequested)) { _ in
             openFiles()
         }
-        .alert(
-            "Transcode Required",
-            isPresented: Binding(
-                get: { store.transcodeRequest != nil },
-                set: { if !$0 { store.confirmTranscode(false) } }
-            )
-        ) {
-            Button("Transcode") { store.confirmTranscode(true) }
-            Button("Cancel", role: .cancel) { store.confirmTranscode(false) }
-        } message: {
-            if let req = store.transcodeRequest {
-                Text("""
-                '\(req.item.displayName)' needs to be transcoded before it can be cast via AirPlay.
-
-                The result will be saved as '\(req.outputURL.lastPathComponent)' in the same folder. \
-                This may take several minutes for large files.
-                """)
-            }
-        }
+        .sheet(isPresented: $showDependencySettings) { DependencySettingsView() }
     }
 
     // MARK: - Video area
@@ -185,7 +172,16 @@ struct MainWindowView: View {
             RoutePickerRepresentable()
                 .frame(width: 32, height: 28)
                 .help("AirPlay / Output device")
+        }
 
+        ToolbarItem {
+            Button { showDependencySettings = true } label: {
+                Label("FFmpeg Settings", systemImage: "gearshape")
+            }
+            .help("Configure and test FFmpeg / FFprobe")
+        }
+
+        ToolbarItem {
             Button(role: .destructive) {
                 controller.stop()
                 store.removeAll()
@@ -220,5 +216,42 @@ struct MainWindowView: View {
     private func remove(_ item: MediaItem) {
         if store.selectedID == item.id { controller.stop() }
         store.remove(item)
+    }
+}
+
+struct DependencySettingsView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var directory = UserDefaults.standard.string(forKey: FFmpegLocator.configuredDirectoryKey) ?? ""
+    @State private var diagnostics: FFmpegDiagnostics?
+    @State private var checking = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("FFmpeg and FFprobe").font(.title2.weight(.semibold))
+            Text("AirPlayDrop uses separately installed FFmpeg tools. Enter the folder containing both executables, or leave it empty to search PATH and common Homebrew locations.")
+                .foregroundStyle(.secondary)
+            TextField("/opt/homebrew/bin", text: $directory)
+                .textFieldStyle(.roundedBorder)
+            if checking { ProgressView("Checking tools…") }
+            if let diagnostics {
+                if let error = diagnostics.error { Text(error).foregroundStyle(.red) }
+                if let version = diagnostics.ffmpegVersion { Text(version).font(.caption.monospaced()) }
+                if let version = diagnostics.ffprobeVersion { Text(version).font(.caption.monospaced()) }
+            }
+            HStack {
+                Button("Save and Test") {
+                    FFmpegLocator.saveConfiguredDirectory(directory)
+                    checking = true
+                    Task {
+                        diagnostics = await FFmpegLocator.diagnose()
+                        checking = false
+                    }
+                }
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(22)
+        .frame(width: 560)
     }
 }

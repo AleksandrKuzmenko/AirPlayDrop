@@ -17,10 +17,12 @@ struct MetadataLoader {
             // transcode progress reporting on files AVFoundation can't play.
             if let duration = try? await asset.load(.duration),
                duration.isValid && !duration.isIndefinite {
+                guard !Task.isCancelled else { throw CancellationError() }
                 item.duration = CMTimeGetSeconds(duration)
             }
 
             let isPlayable = try await asset.load(.isPlayable)
+            guard !Task.isCancelled else { throw CancellationError() }
             guard isPlayable else {
                 logger.warning("Asset not playable: \(item.displayName)")
                 item.state = .unsupported
@@ -28,12 +30,15 @@ struct MetadataLoader {
             }
 
             let flags = await VideoFormatProbe.inspect(asset)
+            guard !Task.isCancelled else { throw CancellationError() }
             item.formatFlags = flags
             item.state = .ready
             if !flags.isEmpty {
                 logger.notice("HDR/DV markers on '\(item.displayName)': \(String(describing: flags))")
             }
             logger.debug("Ready: '\(item.displayName)', duration=\(item.duration ?? 0, format: .fixed(precision: 1))s")
+        } catch is CancellationError {
+            return
         } catch {
             logger.error("Failed to load '\(item.displayName)': \(error.localizedDescription)")
             item.state = .failed(error.localizedDescription)

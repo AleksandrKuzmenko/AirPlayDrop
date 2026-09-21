@@ -13,6 +13,10 @@ final class MediaItem: Identifiable, @unchecked Sendable {
     var state: MediaItemState
     var formatFlags: Set<VideoFormatFlag> = []
     var isAirPlayPrepared = false
+    var mediaInfo: MediaInfo?
+    var trackSelection = TrackSelection()
+    var playbackIntent: PlaybackIntent = .local
+    var preparationReason: String?
 
     /// HDR/DV needs an explicitly AirPlay-safe conversion. A generic remux may
     /// produce an MP4 while retaining Dolby Vision RPU data, an `hev1` sample
@@ -30,6 +34,10 @@ final class MediaItem: Identifiable, @unchecked Sendable {
 
     /// URL handed to AVPlayer — prefers the transcoded copy when available.
     var playbackURL: URL { transcodedURL ?? fileURL }
+
+    var selectedAudio: MediaTrack? {
+        mediaInfo?.audioTracks.first { $0.id == trackSelection.audioID }
+    }
 
     init(fileURL: URL) {
         self.id = UUID()
