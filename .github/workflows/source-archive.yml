@@ -1,0 +1,18 @@
+name: Source archive
+on:
+  workflow_dispatch:
+jobs:
+  archive:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create source archive
+        run: |
+          git archive --format=tar.gz --output=AirPlayDrop-0.1.0-alpha-source.tar.gz HEAD
+          shasum -a 256 AirPlayDrop-0.1.0-alpha-source.tar.gz > AirPlayDrop-0.1.0-alpha-source.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AirPlayDrop-source
+          path: |
+            AirPlayDrop-0.1.0-alpha-source.tar.gz
+            AirPlayDrop-0.1.0-alpha-source.tar.gz.sha256

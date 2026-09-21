@@ -110,7 +110,12 @@ struct TranscodeService {
                 let validation = await MediaArtifactValidator.validate(reservation.temporary)
                 guard validation.isValid else { throw TranscodeError.invalidOutput(validation.reason ?? "Output validation failed") }
                 try FileManager.default.moveItem(at: reservation.temporary, to: reservation.destination)
-                try? MediaArtifactValidator.writeManifest(source: item.fileURL, artifact: reservation.destination, validation: validation)
+                do {
+                    try MediaArtifactValidator.writeManifest(source: item.fileURL, artifact: reservation.destination, validation: validation)
+                } catch {
+                    try? FileManager.default.removeItem(at: reservation.destination)
+                    throw error
+                }
                 item.transcodedURL = reservation.destination
                 item.state = .ready
                 logger.debug("[\(strategy.name)] done: '\(item.displayName)'")
@@ -192,7 +197,12 @@ struct TranscodeService {
                 let validation = await MediaArtifactValidator.validate(reservation.temporary)
                 guard validation.isValid else { throw TranscodeError.invalidOutput(validation.reason ?? "Output validation failed") }
                 try FileManager.default.moveItem(at: reservation.temporary, to: reservation.destination)
-                try? MediaArtifactValidator.writeManifest(source: item.fileURL, artifact: reservation.destination, validation: validation)
+                do {
+                    try MediaArtifactValidator.writeManifest(source: item.fileURL, artifact: reservation.destination, validation: validation)
+                } catch {
+                    try? FileManager.default.removeItem(at: reservation.destination)
+                    throw error
+                }
                 item.transcodedURL = reservation.destination
                 item.isAirPlayPrepared = true
                 item.state = .ready
@@ -247,6 +257,9 @@ struct TranscodeService {
                   let text = String(data: data, encoding: .utf8) else { return }
 
             stderrLog += text
+            if stderrLog.utf8.count > 32_768 {
+                stderrLog = String(stderrLog.suffix(32_768))
+            }
 
             for line in text.components(separatedBy: .newlines) {
                 // Fallback: grab total duration from FFmpeg's "  Duration: HH:MM:SS.ss, ..."

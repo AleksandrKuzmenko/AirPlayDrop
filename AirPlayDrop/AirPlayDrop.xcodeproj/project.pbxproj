@@ -28,6 +28,7 @@
 		AB0001000000000000000078 /* MediaTrack.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000079 /* MediaTrack.swift */; };
 		AB0001000000000000000081 /* FFmpegLocator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000082 /* FFmpegLocator.swift */; };
 		AB0001000000000000000083 /* AirPlayDropTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000084 /* AirPlayDropTests.swift */; };
+		AB0001000000000000000096 /* FFprobeService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000097 /* FFprobeService.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -73,6 +74,7 @@
 		AB0001000000000000000082 /* FFmpegLocator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FFmpegLocator.swift; sourceTree = "<group>"; };
 		AB0001000000000000000084 /* AirPlayDropTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AirPlayDropTests.swift; sourceTree = "<group>"; };
 		AB0001000000000000000085 /* AirPlayDropTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AirPlayDropTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		AB0001000000000000000097 /* FFprobeService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FFprobeService.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -134,6 +136,7 @@
 				AB0001000000000000000072 /* VideoFormatProbe.swift */,
 				AB0001000000000000000077 /* MediaArtifactValidator.swift */,
 				AB0001000000000000000082 /* FFmpegLocator.swift */,
+				AB0001000000000000000097 /* FFprobeService.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -277,6 +280,7 @@
 				AB0001000000000000000076 /* MediaArtifactValidator.swift in Sources */,
 				AB0001000000000000000078 /* MediaTrack.swift in Sources */,
 				AB0001000000000000000081 /* FFmpegLocator.swift in Sources */,
+				AB0001000000000000000096 /* FFprobeService.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
