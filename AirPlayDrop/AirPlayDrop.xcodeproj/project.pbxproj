@@ -24,6 +24,9 @@
 		AB0001000000000000000045 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000027 /* AVFoundation.framework */; };
 		AB0001000000000000000046 /* TranscodeService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000028 /* TranscodeService.swift */; };
 		AB0001000000000000000073 /* VideoFormatProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000072 /* VideoFormatProbe.swift */; };
+		AB0001000000000000000076 /* MediaArtifactValidator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000077 /* MediaArtifactValidator.swift */; };
+		AB0001000000000000000078 /* MediaTrack.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000079 /* MediaTrack.swift */; };
+		AB0001000000000000000081 /* FFmpegLocator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000082 /* FFmpegLocator.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -46,6 +49,9 @@
 		AB0001000000000000000027 /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
 		AB0001000000000000000028 /* TranscodeService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscodeService.swift; sourceTree = "<group>"; };
 		AB0001000000000000000072 /* VideoFormatProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoFormatProbe.swift; sourceTree = "<group>"; };
+		AB0001000000000000000077 /* MediaArtifactValidator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaArtifactValidator.swift; sourceTree = "<group>"; };
+		AB0001000000000000000079 /* MediaTrack.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaTrack.swift; sourceTree = "<group>"; };
+		AB0001000000000000000082 /* FFmpegLocator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FFmpegLocator.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -92,6 +98,7 @@
 				AB0001000000000000000017 /* MediaItem.swift */,
 				AB0001000000000000000018 /* MediaItemState.swift */,
 				AB0001000000000000000019 /* PlaylistStore.swift */,
+				AB0001000000000000000079 /* MediaTrack.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -104,6 +111,8 @@
 				AB0001000000000000000022 /* MetadataLoader.swift */,
 				AB0001000000000000000028 /* TranscodeService.swift */,
 				AB0001000000000000000072 /* VideoFormatProbe.swift */,
+				AB0001000000000000000077 /* MediaArtifactValidator.swift */,
+				AB0001000000000000000082 /* FFmpegLocator.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -217,6 +226,9 @@
 				AB0001000000000000000042 /* MetadataLoader.swift in Sources */,
 				AB0001000000000000000046 /* TranscodeService.swift in Sources */,
 				AB0001000000000000000073 /* VideoFormatProbe.swift in Sources */,
+				AB0001000000000000000076 /* MediaArtifactValidator.swift in Sources */,
+				AB0001000000000000000078 /* MediaTrack.swift in Sources */,
+				AB0001000000000000000081 /* FFmpegLocator.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -233,14 +245,14 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 AirPlayDrop contributors";
 				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 0.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.airplaydrop.AirPlayDrop;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -259,14 +271,14 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 AirPlayDrop contributors";
 				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 0.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.airplaydrop.AirPlayDrop;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;

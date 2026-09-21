@@ -8,6 +8,7 @@ private let logger = Logger(subsystem: "com.airplaydrop", category: "TranscodeSe
 enum TranscodeError: LocalizedError {
     case ffmpegNotFound
     case processFailed(Int32)
+    case invalidOutput(String)
 
     var errorDescription: String? {
         switch self {
@@ -15,6 +16,8 @@ enum TranscodeError: LocalizedError {
             return "FFmpeg not found. Install with: brew install ffmpeg"
         case .processFailed(let code):
             return "FFmpeg exited with code \(code). Check Console for details."
+        case .invalidOutput(let reason):
+            return "Generated media failed validation: \(reason)"
         }
     }
 }
@@ -35,13 +38,12 @@ struct TranscodeService {
             .first { FileManager.default.isExecutableFile(atPath: $0.path) }
     }
 
-    /// Output path for the transcoded file — saved next to the source so the user can find and
-    /// reuse it. Appends `_cast` only when the source is already an `.mp4` to avoid collision.
+    /// Returns the first conventional output path. Actual jobs reserve a unique path and never
+    /// overwrite this value; this method remains for display and compatibility with older callers.
     static func outputURL(for input: URL) -> URL {
         let dir = input.deletingLastPathComponent()
         let stem = input.deletingPathExtension().lastPathComponent
-        let suffix = input.pathExtension.lowercased() == "mp4" ? "_cast" : ""
-        return dir.appendingPathComponent(stem + suffix + ".mp4")
+        return dir.appendingPathComponent(stem + "_airplay.mp4")
     }
 
     // MARK: - Main entry point (called from @MainActor context)
@@ -58,8 +60,9 @@ struct TranscodeService {
             return
         }
 
-        let output = outputURL(for: item.fileURL)
-        try? FileManager.default.removeItem(at: output)
+        let reservation: OutputReservation
+        do { reservation = try OutputReservation.reserve(for: item.fileURL) }
+        catch { item.state = .failed("Could not reserve an output file: \(error.localizedDescription)"); return }
 
         // Strategy cascade — fastest / highest quality first.
         //
@@ -100,18 +103,20 @@ struct TranscodeService {
                 try await runFFmpeg(
                     ffmpeg: ffmpeg,
                     input: item.fileURL,
-                    output: output,
+                    output: reservation.temporary,
                     codecArgs: strategy.codecArgs,
                     item: item
                 )
-                // Success — hand the transcoded URL back to the item on @MainActor.
-                item.transcodedURL = output
+                let validation = await MediaArtifactValidator.validate(reservation.temporary)
+                guard validation.isValid else { throw TranscodeError.invalidOutput(validation.reason ?? "Output validation failed") }
+                try FileManager.default.moveItem(at: reservation.temporary, to: reservation.destination)
+                item.transcodedURL = reservation.destination
                 item.state = .ready
                 logger.debug("[\(strategy.name)] done: '\(item.displayName)'")
                 return
             } catch {
                 logger.warning("[\(strategy.name)] failed: \(error.localizedDescription)")
-                try? FileManager.default.removeItem(at: output)
+                try? FileManager.default.removeItem(at: reservation.temporary)
             }
         }
 
@@ -136,8 +141,9 @@ struct TranscodeService {
             return
         }
 
-        let output = outputURL(for: item.fileURL)
-        try? FileManager.default.removeItem(at: output)
+        let reservation: OutputReservation
+        do { reservation = try OutputReservation.reserve(for: item.fileURL) }
+        catch { item.state = .failed("Could not reserve an output file: \(error.localizedDescription)"); return }
 
         let streamArgs = [
             "-map", "0:v:0",
@@ -178,18 +184,21 @@ struct TranscodeService {
                 try await runFFmpeg(
                     ffmpeg: ffmpeg,
                     input: item.fileURL,
-                    output: output,
+                    output: reservation.temporary,
                     codecArgs: strategy.codecArgs,
                     item: item
                 )
-                item.transcodedURL = output
+                let validation = await MediaArtifactValidator.validate(reservation.temporary)
+                guard validation.isValid else { throw TranscodeError.invalidOutput(validation.reason ?? "Output validation failed") }
+                try FileManager.default.moveItem(at: reservation.temporary, to: reservation.destination)
+                item.transcodedURL = reservation.destination
                 item.isAirPlayPrepared = true
                 item.state = .ready
                 logger.debug("[\(strategy.name)] done: '\(item.displayName)'")
                 return
             } catch {
                 logger.warning("[\(strategy.name)] failed: \(error.localizedDescription)")
-                try? FileManager.default.removeItem(at: output)
+                try? FileManager.default.removeItem(at: reservation.temporary)
             }
         }
 
@@ -209,7 +218,7 @@ struct TranscodeService {
         // -nostats     : suppress the inline stats overlay (uses \r — hard to parse)
         // -progress p:2: write structured key=value progress to stderr once per second
         let argv: [String] = [
-            "-y", "-nostats", "-progress", "pipe:2",
+            "-nostats", "-progress", "pipe:2",
             "-i", input.path,
         ] + codecArgs + ["-movflags", "+faststart", output.path]
 

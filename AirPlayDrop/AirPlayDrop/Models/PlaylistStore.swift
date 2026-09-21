@@ -123,8 +123,6 @@ final class PlaylistStore {
     /// Wipes any cached transcode output and re-runs the full pipeline from scratch.
     func retry(_ item: MediaItem) {
         processTasks[item.id]?.cancel()
-        let out = TranscodeService.outputURL(for: item.fileURL)
-        try? FileManager.default.removeItem(at: out)
         item.transcodedURL = nil
         item.isAirPlayPrepared = false
         item.state = .idle
@@ -135,8 +133,6 @@ final class PlaylistStore {
     /// Use when AirPlay external playback rejects the native codec.
     func forceTranscode(_ item: MediaItem) {
         processTasks[item.id]?.cancel()
-        let out = TranscodeService.outputURL(for: item.fileURL)
-        try? FileManager.default.removeItem(at: out)
         item.transcodedURL = nil
         item.isAirPlayPrepared = false
         item.state = .idle
@@ -168,7 +164,8 @@ final class PlaylistStore {
             if case .unsupported = item.state {
                 let outputURL = TranscodeService.outputURL(for: item.fileURL)
 
-                if FileManager.default.fileExists(atPath: outputURL.path) {
+                let cached = await MediaArtifactValidator.validate(outputURL)
+                if cached.isValid {
                     item.transcodedURL = outputURL
                     item.state = .ready
                 } else {
