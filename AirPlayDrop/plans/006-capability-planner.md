@@ -36,4 +36,3 @@ In scope: `TranscodeService`, probe models, a pure `TranscodePlanner`, presets, 
 ## STOP conditions
 
 Stop if source capabilities cannot be determined reliably; report the missing probe fields rather than falling back to filename-based decisions.
-

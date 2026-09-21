@@ -36,4 +36,3 @@ In scope: repository documentation, templates, `.gitignore`, Xcode metadata clea
 ## STOP conditions
 
 Stop if the repository owner's legal name/copyright attribution cannot be determined from existing Git metadata; use the GitHub owner name and flag it for human review rather than inventing an identity.
-

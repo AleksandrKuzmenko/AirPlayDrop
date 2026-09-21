@@ -48,4 +48,3 @@ In scope: Xcode project, a new `AirPlayDropTests` target, test fixtures/helpers,
 ## STOP conditions
 
 Stop if Xcode cannot share a scheme containing the test action, or if testing requires copying production sources into the test target instead of importing the app module.
-

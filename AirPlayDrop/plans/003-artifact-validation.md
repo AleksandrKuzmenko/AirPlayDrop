@@ -35,4 +35,3 @@ In scope: `VideoFormatProbe`, `TranscodeService`, `PlaylistStore`, a new `MediaA
 ## STOP conditions
 
 Stop if validation would require shipping copyrighted fixtures or trusting FFprobe alone for Apple playback compatibility; use generated fixtures and AVFoundation checks.
-

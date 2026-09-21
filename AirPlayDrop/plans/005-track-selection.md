@@ -36,4 +36,3 @@ In scope: a probe service, media-track models, `MediaItem`, playlist/details UI,
 ## STOP conditions
 
 Stop if FFprobe JSON is parsed with ad-hoc string splitting or if unsupported subtitles are silently discarded despite a user selection.
-

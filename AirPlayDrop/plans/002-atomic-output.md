@@ -41,4 +41,3 @@ In scope: `TranscodeService`, `PlaylistStore`, new output/artifact helper types,
 ## STOP conditions
 
 Stop if the design requires identifying app-owned files solely by basename or modification date. Use explicit job/artifact state instead.
-

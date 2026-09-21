@@ -35,4 +35,3 @@ In scope: playback/store coordination, observable job state, alerts/sheets, play
 ## STOP conditions
 
 Stop if the implementation attempts to programmatically select an AirPlay route through private API. Use only public AVKit/AVFoundation behavior and user guidance.
-

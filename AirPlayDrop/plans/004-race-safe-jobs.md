@@ -36,4 +36,3 @@ In scope: `TranscodeService`, `PlaylistStore`, `MediaItemState`, playlist contro
 ## STOP conditions
 
 Stop if a proposed solution relies on sleeps, global locks, or ignoring Sendable warnings.
-

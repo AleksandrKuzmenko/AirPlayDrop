@@ -36,4 +36,3 @@ In scope: runtime dependency discovery/configuration, diagnostics UI, distributi
 ## STOP conditions
 
 Stop before adding any Apple signing secret, notarization credential, FFmpeg binary, or public release. Those require explicit maintainer action and legal review.
-
