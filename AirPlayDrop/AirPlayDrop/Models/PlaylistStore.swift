@@ -243,14 +243,16 @@ final class PlaylistStore {
                     item.preparationReason = "Reused a validated prepared copy."
                     item.state = .ready
                 } else {
+                    let progressStore = self
+                    let progressItem = item
                     let artifact = try await TranscodeService.prepare(input: item.fileURL, info: info,
                         selection: item.trackSelection, intent: intent,
                         syncAdjustment: item.syncAdjustment,
-                        audioProcessingMode: item.audioProcessingMode) { [weak self, weak item] progress in
+                        audioProcessingMode: item.audioProcessingMode) { progress in
                             Task { @MainActor in
-                                guard let self, let item, self.isCurrent(token, for: item) else { return }
-                                if case .transcoding(let old) = item.state {
-                                    item.state = .transcoding(max(old, progress))
+                                guard progressStore.isCurrent(token, for: progressItem) else { return }
+                                if case .transcoding(let old) = progressItem.state {
+                                    progressItem.state = .transcoding(max(old, progress))
                                 }
                             }
                         }
