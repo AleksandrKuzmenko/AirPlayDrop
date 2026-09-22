@@ -8,7 +8,7 @@ AirPlayDrop is currently an alpha. Security fixes are applied to the latest comm
 
 Do not open a public issue for a suspected vulnerability. Use GitHub's private vulnerability reporting form:
 
-https://github.com/AleksandrKuzmenko/APremote/security/advisories/new
+https://github.com/AleksandrKuzmenko/AirPlayDrop/security/advisories/new
 
 Include the affected version or commit, macOS version, reproduction steps, impact, and any suggested mitigation. Avoid attaching personal media; use a minimal generated fixture whenever possible.
 

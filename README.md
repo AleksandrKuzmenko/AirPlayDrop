@@ -38,8 +38,8 @@ AirPlayDrop searches `PATH`, `/opt/homebrew/bin`, `/usr/local/bin`, and `/usr/bi
 Clone the repository and open the Xcode project:
 
 ```sh
-git clone https://github.com/AleksandrKuzmenko/APremote.git
-cd APremote
+git clone https://github.com/AleksandrKuzmenko/AirPlayDrop.git
+cd AirPlayDrop
 open AirPlayDrop/AirPlayDrop.xcodeproj
 ```
 
