@@ -11,24 +11,53 @@ struct TransportBarView: View {
 
     var body: some View {
         VStack(spacing: 2) {
+            if isScrubbing, let image = controller.scrubPreview {
+                Image(decorative: image, scale: 1, orientation: .up)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: 240, maxHeight: 135)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .overlay(alignment: .bottom) {
+                        Text(format(scrubValue))
+                            .font(.caption.monospacedDigit())
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(.black.opacity(0.7), in: Capsule())
+                            .foregroundStyle(.white)
+                            .padding(4)
+                    }
+                    .accessibilityHidden(true)
+            }
             Slider(
                 value: Binding(
                     get: { isScrubbing ? scrubValue : controller.currentTime },
-                    set: { scrubValue = $0 }
+                    set: {
+                        scrubValue = $0
+                        if isScrubbing { controller.requestThumbnail(at: $0) }
+                    }
                 ),
                 in: 0...max(controller.duration, 0.01),
                 onEditingChanged: { editing in
                     if editing {
+                        scrubValue = controller.currentTime
                         isScrubbing = true
+                        controller.requestThumbnail(at: scrubValue)
                     } else {
                         controller.seek(to: scrubValue)
                         isScrubbing = false
+                        controller.clearThumbnail()
                     }
                 }
             )
             .disabled(!seekable)
 
             HStack(spacing: 10) {
+                if controller.hasResumableProgress {
+                    Button("Start Over") { controller.startOver() }
+                        .buttonStyle(.borderless)
+                        .help("Start this video from the beginning")
+                        .accessibilityLabel("Start Over")
+                }
                 Text(format(isScrubbing ? scrubValue : controller.currentTime))
                     .font(.caption)
                     .foregroundStyle(.secondary)

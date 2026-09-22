@@ -10,6 +10,10 @@ struct PlaylistView: View {
     let onCancel: (MediaItem) -> Void
     let onChooseAudio: (MediaItem, Int?) -> Void
     let onChooseSubtitle: (MediaItem, Int?) -> Void
+    let onChooseSubtitleSelection: (MediaItem, SubtitleSelection) -> Void
+    let onAttachSubtitle: (MediaItem) -> Void
+    let onSetAudioProcessingMode: (MediaItem, AudioProcessingMode) -> Void
+    let onAdjustSynchronization: (MediaItem) -> Void
 
     var body: some View {
         Group {
@@ -81,12 +85,12 @@ struct PlaylistView: View {
                             }
                         }
 
-                        if let info = item.mediaInfo, !info.subtitleTracks.isEmpty {
+                        if let info = item.mediaInfo {
                             Menu("Subtitles") {
                                 Button {
                                     onChooseSubtitle(item, nil)
                                 } label: {
-                                    if item.trackSelection.subtitleID == nil { Label("None", systemImage: "checkmark") }
+                                    if item.trackSelection.subtitle.isNone { Label("None", systemImage: "checkmark") }
                                     else { Text("None") }
                                 }
                                 ForEach(info.subtitleTracks.filter(\.isTextSubtitle)) { track in
@@ -98,8 +102,49 @@ struct PlaylistView: View {
                                         } else { Text(track.displayName) }
                                     }
                                 }
+                                if let external = item.selectedExternalSubtitle {
+                                    Button {
+                                        onChooseSubtitleSelection(item, .external(external))
+                                    } label: {
+                                        if item.trackSelection.subtitle == .external(external) {
+                                            Label(external.displayName, systemImage: "checkmark")
+                                        } else { Text(external.displayName) }
+                                    }
+                                }
+                                ForEach(ExternalSubtitleService.discover(for: item.fileURL,
+                                                                         preferences: store.preferencesStore.preferences)
+                                    .filter { sidecar in
+                                        sidecar.standardizedURL != item.selectedExternalSubtitle?.standardizedURL
+                                    },
+                                        id: \.url) { sidecar in
+                                    Button {
+                                        onChooseSubtitleSelection(item, .external(sidecar))
+                                    } label: {
+                                        if item.trackSelection.subtitle == .external(sidecar) {
+                                            Label(sidecar.displayName, systemImage: "checkmark")
+                                        } else { Text(sidecar.displayName) }
+                                    }
+                                }
+                                Divider()
+                                Button("Attach Subtitle…") { onAttachSubtitle(item) }
                             }
                         }
+
+                        Menu("Audio Processing") {
+                            ForEach(AudioProcessingMode.allCases, id: \.self) { mode in
+                                Button {
+                                    onSetAudioProcessingMode(item, mode)
+                                } label: {
+                                    if item.audioProcessingMode == mode {
+                                        Label(mode.label, systemImage: "checkmark")
+                                    } else { Text(mode.label) }
+                                }
+                            }
+                            Text("Late Night re-encodes audio with controlled compression and does not isolate voices.")
+                                .font(.caption)
+                        }
+
+                        Button("Adjust Synchronization…") { onAdjustSynchronization(item) }
 
                         Divider()
 

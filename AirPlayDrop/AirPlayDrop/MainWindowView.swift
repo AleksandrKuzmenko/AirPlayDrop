@@ -6,6 +6,8 @@ struct MainWindowView: View {
     @State private var controller = PlaybackController()
     @State private var isDropTargeted = false
     @State private var showDependencySettings = false
+    @State private var showPlaybackSettings = false
+    @State private var synchronizationItem: MediaItem?
 
     var body: some View {
         HSplitView {
@@ -18,7 +20,11 @@ struct MainWindowView: View {
                 onPrepare: { store.prepare($0, for: $1) },
                 onCancel: { store.cancel($0) },
                 onChooseAudio: { store.chooseAudio($1, for: $0) },
-                onChooseSubtitle: { store.chooseSubtitle($1, for: $0) }
+                onChooseSubtitle: { store.chooseSubtitle($1, for: $0) },
+                onChooseSubtitleSelection: { store.chooseSubtitle($1, for: $0) },
+                onAttachSubtitle: { attachSubtitle(to: $0) },
+                onSetAudioProcessingMode: { store.setAudioProcessingMode($1, for: $0) },
+                onAdjustSynchronization: { synchronizationItem = $0 }
             )
             .frame(minWidth: 220, idealWidth: 280, maxWidth: 380)
 
@@ -27,6 +33,7 @@ struct MainWindowView: View {
                     .frame(minWidth: 480, minHeight: 320)
                 if controller.loadedItem != nil {
                     Divider()
+                    resumeBanner
                     TransportBarView(controller: controller)
                 }
             }
@@ -74,7 +81,17 @@ struct MainWindowView: View {
         .onReceive(NotificationCenter.default.publisher(for: .openFileRequested)) { _ in
             openFiles()
         }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            controller.flushHistory()
+        }
         .sheet(isPresented: $showDependencySettings) { DependencySettingsView() }
+        .sheet(isPresented: $showPlaybackSettings) { PlaybackSettingsView() }
+        .sheet(item: $synchronizationItem) { item in
+            SynchronizationSettingsView(item: item) { adjustment in
+                store.setSyncAdjustment(adjustment, for: item)
+                synchronizationItem = nil
+            }
+        }
     }
 
     // MARK: - Video area
@@ -138,6 +155,24 @@ struct MainWindowView: View {
         }
     }
 
+    @ViewBuilder
+    private var resumeBanner: some View {
+        if let proposal = controller.resumeProposal {
+            HStack(spacing: 10) {
+                Text("Resume from \(formatTime(proposal.position))?")
+                    .font(.callout)
+                Button("Resume") { controller.resume() }
+                Button("Start Over") { controller.startOver() }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.thinMaterial)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Resume playback from \(formatTime(proposal.position))")
+        }
+    }
+
     // MARK: - Toolbar
 
     @ToolbarContentBuilder
@@ -172,13 +207,16 @@ struct MainWindowView: View {
             RoutePickerRepresentable()
                 .frame(width: 32, height: 28)
                 .help("AirPlay / Output device")
-        }
 
-        ToolbarItem {
             Button { showDependencySettings = true } label: {
                 Label("FFmpeg Settings", systemImage: "gearshape")
             }
             .help("Configure and test FFmpeg / FFprobe")
+
+            Button { showPlaybackSettings = true } label: {
+                Label("Playback Settings", systemImage: "captions.bubble")
+            }
+            .help("Preferred languages apply to newly imported videos")
         }
 
         ToolbarItem {
@@ -208,6 +246,13 @@ struct MainWindowView: View {
         }
     }
 
+    private func attachSubtitle(to item: MediaItem) {
+        FileImportService.openSubtitlePanel { url in
+            guard let url else { return }
+            _ = store.attachSubtitle(url, to: item)
+        }
+    }
+
     private func play(_ item: MediaItem) {
         controller.prepare(item: item)
         controller.play()
@@ -216,6 +261,127 @@ struct MainWindowView: View {
     private func remove(_ item: MediaItem) {
         if store.selectedID == item.id { controller.stop() }
         store.remove(item)
+    }
+
+    private func formatTime(_ seconds: Double) -> String {
+        let total = max(Int(seconds), 0)
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
+    }
+}
+
+struct PlaybackSettingsView: View {
+    @Environment(\.dismiss) private var dismiss
+    private let preferenceStore = PlaybackPreferencesStore()
+    @State private var audioLanguages: String
+    @State private var subtitleLanguages: String
+    @State private var subtitleMode: SubtitleDefaultMode
+
+    init() {
+        let preferences = PlaybackPreferencesStore().preferences
+        _audioLanguages = State(initialValue: preferences.preferredAudioLanguages.joined(separator: ", "))
+        _subtitleLanguages = State(initialValue: preferences.preferredSubtitleLanguages.joined(separator: ", "))
+        _subtitleMode = State(initialValue: preferences.subtitleDefaultMode)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Playback").font(.title2.weight(.semibold))
+            Text("These language preferences apply to newly imported videos. Per-video track choices remain unchanged.")
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Language preferences apply to newly imported videos")
+            TextField("Audio languages (en, sr-Latn)", text: $audioLanguages)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Preferred audio languages, in order")
+            languageNames(for: audioLanguages)
+            TextField("Subtitle languages (en, sr)", text: $subtitleLanguages)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Preferred subtitle languages, in order")
+            languageNames(for: subtitleLanguages)
+            Picker("Subtitle defaults", selection: $subtitleMode) {
+                ForEach(SubtitleDefaultMode.allCases, id: \.self) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .accessibilityLabel("Subtitle default mode for newly imported videos")
+            HStack {
+                Button("Reset to System Default") {
+                    preferenceStore.reset()
+                    let value = preferenceStore.preferences
+                    audioLanguages = value.preferredAudioLanguages.joined(separator: ", ")
+                    subtitleLanguages = ""
+                    subtitleMode = .off
+                }
+                Spacer()
+                Button("Save") {
+                    preferenceStore.preferences = PlaybackPreferences(
+                        preferredAudioLanguages: audioLanguages.split(separator: ",").map(String.init),
+                        preferredSubtitleLanguages: subtitleLanguages.split(separator: ",").map(String.init),
+                        subtitleDefaultMode: subtitleMode)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(22)
+        .frame(width: 560)
+    }
+
+    @ViewBuilder
+    private func languageNames(for value: String) -> some View {
+        let codes = value.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        if !codes.isEmpty {
+            Text(codes.map { Locale.current.localizedString(forLanguageCode: String($0)) ?? String($0) }.joined(separator: ", "))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+struct SynchronizationSettingsView: View {
+    @Environment(\.dismiss) private var dismiss
+    let item: MediaItem
+    let onSave: (SyncAdjustment) -> Void
+    @State private var audioMilliseconds: String
+    @State private var subtitleMilliseconds: String
+
+    init(item: MediaItem, onSave: @escaping (SyncAdjustment) -> Void) {
+        self.item = item
+        self.onSave = onSave
+        _audioMilliseconds = State(initialValue: String(item.syncAdjustment.audioMilliseconds))
+        _subtitleMilliseconds = State(initialValue: String(item.syncAdjustment.subtitleMilliseconds))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Adjust Synchronization").font(.title2.weight(.semibold))
+            Text("Positive values play the selected stream later; negative values play it earlier. Preparation must run again.")
+                .foregroundStyle(.secondary)
+            TextField("Audio milliseconds", text: $audioMilliseconds)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Audio synchronization offset in milliseconds")
+            TextField("Subtitle milliseconds", text: $subtitleMilliseconds)
+                .textFieldStyle(.roundedBorder)
+                .disabled(!item.trackSelection.hasSelectedSubtitle)
+                .accessibilityLabel("Subtitle synchronization offset in milliseconds")
+            HStack {
+                Button("Reset") {
+                    audioMilliseconds = "0"
+                    subtitleMilliseconds = "0"
+                }
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Save") {
+                    onSave(SyncAdjustment(audioMilliseconds: Int(audioMilliseconds) ?? 0,
+                                          subtitleMilliseconds: Int(subtitleMilliseconds) ?? 0))
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(22)
+        .frame(width: 440)
     }
 }
 

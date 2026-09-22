@@ -18,8 +18,20 @@ struct AirPlayDropApp: App {
             }
         }
         Settings {
-            DependencySettingsView()
+            AirPlayDropSettingsView()
         }
+    }
+}
+
+private struct AirPlayDropSettingsView: View {
+    var body: some View {
+        TabView {
+            PlaybackSettingsView()
+                .tabItem { Label("Playback", systemImage: "captions.bubble") }
+            DependencySettingsView()
+                .tabItem { Label("FFmpeg", systemImage: "gearshape") }
+        }
+        .frame(width: 600, height: 360)
     }
 }
 

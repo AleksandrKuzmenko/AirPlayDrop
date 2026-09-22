@@ -13,6 +13,8 @@ struct FFprobeStream: Codable, Equatable, Sendable {
     let pix_fmt: String?
     let color_transfer: String?
     let side_data_list: [[String: String]]?
+
+    var isForced: Bool { disposition?["forced"] == 1 }
 }
 
 struct FFprobeFormat: Codable, Equatable, Sendable {
@@ -67,7 +69,8 @@ enum FFprobeService {
             return MediaTrack(id: stream.index, kind: kind, codec: codec,
                 language: stream.tags?["language"], title: stream.tags?["title"], channels: stream.channels,
                 isDefault: stream.disposition?["default"] == 1,
-                isTextSubtitle: kind == .subtitle && textCodecs.contains(codec))
+                isTextSubtitle: kind == .subtitle && textCodecs.contains(codec),
+                isForced: stream.disposition?["forced"] == 1)
         }
         let sideData = video?.side_data_list ?? []
         let isDV = sideData.contains { values in
@@ -81,10 +84,33 @@ enum FFprobeService {
 
     static func preferredAudio(from streams: [FFprobeStream], preferredLanguage: String? = Locale.current.language.languageCode?.identifier) -> FFprobeStream? {
         let audio = streams.filter { $0.codec_type == "audio" }
-        return audio.first(where: { $0.disposition?["default"] == 1 && $0.tags?["language"]?.lowercased() == preferredLanguage?.lowercased() })
+        let preferences = preferredLanguage.map { [$0] } ?? []
+        return preferredAudio(from: audio, preferredLanguages: preferences)
             ?? audio.first(where: { $0.disposition?["default"] == 1 })
-            ?? audio.first(where: { $0.tags?["language"]?.lowercased() == preferredLanguage?.lowercased() })
             ?? audio.first
+    }
+
+    static func preferredAudio(from streams: [FFprobeStream], preferredLanguages: [String]) -> FFprobeStream? {
+        let audio = streams.filter { $0.codec_type == "audio" }
+        let normalized = PlaybackPreferences.normalizedCodes(preferredLanguages)
+
+        // Exact language matches win over primary-subtag matches. Within each
+        // preference, a default stream wins, followed by the first stream in
+        // probe order. This makes selection stable for duplicate tracks.
+        for exact in [true, false] {
+            for preferred in normalized {
+                let candidates = audio.filter { stream in
+                    guard let language = stream.tags?["language"] else { return false }
+                    guard let actual = PlaybackPreferences.normalizedCodes([language]).first else { return false }
+                    if exact { return actual == preferred }
+                    return actual.split(separator: "-").first.map(String.init) == preferred.split(separator: "-").first.map(String.init)
+                }
+                if let selected = candidates.first(where: { $0.disposition?["default"] == 1 }) ?? candidates.first {
+                    return selected
+                }
+            }
+        }
+        return nil
     }
 
     static func arguments(audioIndex: Int?, subtitleIndex: Int? = nil) -> [String] {
@@ -94,14 +120,62 @@ enum FFprobeService {
         return args
     }
 
-    static func defaultSelection(from info: MediaInfo, preferredLanguage: String? = Locale.current.language.languageCode?.identifier) -> TrackSelection {
+    static func defaultSelection(from info: MediaInfo,
+                                 preferences: PlaybackPreferences = .systemDefault) -> TrackSelection {
         let streams = info.audioTracks.map {
             FFprobeStream(index: $0.id, codec_type: "audio", codec_name: $0.codec, codec_long_name: nil,
                 channels: $0.channels, channel_layout: nil, tags: ["language": $0.language].compactMapValues { $0 },
                 disposition: ["default": $0.isDefault ? 1 : 0], profile: nil, pix_fmt: nil,
                 color_transfer: nil, side_data_list: nil)
         }
-        return TrackSelection(audioID: preferredAudio(from: streams, preferredLanguage: preferredLanguage)?.index,
-            subtitleID: nil, subtitlePolicy: .omit)
+        let audioID = preferredAudio(from: streams, preferredLanguages: preferences.preferredAudioLanguages)?.index
+            ?? streams.first(where: { $0.disposition?["default"] == 1 })?.index
+            ?? streams.first?.index
+
+        let textSubtitles = info.subtitleTracks.filter(\.isTextSubtitle)
+        let subtitle: SubtitleSelection
+        switch preferences.subtitleDefaultMode {
+        case .off:
+            subtitle = .none
+        case .preferred:
+            subtitle = subtitleSelection(from: textSubtitles,
+                                         preferredLanguages: preferences.preferredSubtitleLanguages,
+                                         forcedOnly: false)
+        case .forcedPreferred:
+            subtitle = subtitleSelection(from: textSubtitles,
+                                         preferredLanguages: preferences.preferredSubtitleLanguages,
+                                         forcedOnly: true)
+        }
+        return TrackSelection(audioID: audioID, subtitle: subtitle,
+                              subtitlePolicy: subtitle.isNone ? .omit : .includeSelected)
+    }
+
+    static func defaultSelection(from info: MediaInfo, preferredLanguage: String?) -> TrackSelection {
+        var preferences = PlaybackPreferences()
+        preferences.preferredAudioLanguages = PlaybackPreferences.normalizedCodes(preferredLanguage.map { [$0] } ?? [])
+        return defaultSelection(from: info, preferences: preferences)
+    }
+
+    private static func subtitleSelection(from tracks: [MediaTrack], preferredLanguages: [String], forcedOnly: Bool) -> SubtitleSelection {
+        let candidates = tracks.filter { !forcedOnly || $0.isForced }
+        guard !candidates.isEmpty else { return .none }
+        let normalized = PlaybackPreferences.normalizedCodes(preferredLanguages)
+        for exact in [true, false] {
+            for preferred in normalized {
+                let matches = candidates.filter { track in
+                    guard let language = track.language else { return false }
+                    guard let actual = PlaybackPreferences.normalizedCodes([language]).first else { return false }
+                    if exact { return actual == preferred }
+                    return actual.split(separator: "-").first.map(String.init) == preferred.split(separator: "-").first.map(String.init)
+                }
+                if let selected = matches.first(where: { $0.isDefault }) ?? matches.first {
+                    return .embedded(streamID: selected.id)
+                }
+            }
+        }
+        if let selected = candidates.first(where: { $0.isDefault }) ?? candidates.first {
+            return .embedded(streamID: selected.id)
+        }
+        return .none
     }
 }

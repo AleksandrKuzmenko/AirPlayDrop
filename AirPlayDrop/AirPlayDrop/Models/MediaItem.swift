@@ -15,7 +15,10 @@ final class MediaItem: Identifiable, @unchecked Sendable {
     var isAirPlayPrepared = false
     var mediaInfo: MediaInfo?
     var trackSelection = TrackSelection()
+    var hasAppliedInitialSelection = false
     var playbackIntent: PlaybackIntent = .local
+    var syncAdjustment = SyncAdjustment()
+    var audioProcessingMode: AudioProcessingMode = .standard
     var preparationReason: String?
 
     /// HDR/DV needs an explicitly AirPlay-safe conversion. A generic remux may
@@ -37,6 +40,10 @@ final class MediaItem: Identifiable, @unchecked Sendable {
 
     var selectedAudio: MediaTrack? {
         mediaInfo?.audioTracks.first { $0.id == trackSelection.audioID }
+    }
+
+    var selectedExternalSubtitle: ExternalSubtitleDescriptor? {
+        trackSelection.subtitle.externalDescriptor
     }
 
     init(fileURL: URL) {

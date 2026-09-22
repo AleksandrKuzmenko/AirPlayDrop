@@ -1,4 +1,6 @@
 import XCTest
+import CoreGraphics
+import AVFoundation
 @testable import AirPlayDrop
 
 final class AirPlayDropTests: XCTestCase {
@@ -48,6 +50,14 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertTrue(TranscodePlanner.plan(info: info(format: "mp4", video: "h264"), intent: .local).steps.isEmpty)
     }
 
+    func testSelectedSubtitleForcesMuxButKeepsCompatibleAudioCopy() {
+        let plan = TranscodePlanner.plan(info: info(format: "mp4", video: "h264"), intent: .local,
+                                         requiresSubtitleMuxing: true)
+        XCTAssertFalse(plan.steps.isEmpty)
+        XCTAssertEqual(plan.steps.first?.strategy, .remux)
+        XCTAssertEqual(plan.steps.first?.audioArguments, ["-c:a", "copy"])
+    }
+
     func testMatroskaUsesTypedFallbacks() {
         let plan = TranscodePlanner.plan(info: info(), intent: .local)
         XCTAssertEqual(plan.steps.first?.strategy, .remux)
@@ -78,6 +88,24 @@ final class AirPlayDropTests: XCTestCase {
         let args = try TranscodeService.streamArguments(selection: selection, sourceHasAudio: true)
         XCTAssertTrue(args.contains("0:7"))
         XCTAssertFalse(args.contains("-sn"))
+    }
+
+    func testExternalSubtitleUsesSecondInputAndPreservesPathAsOneArgument() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("movie with spaces \(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sidecar = directory.appendingPathComponent("Movie.en.srt")
+        try Data("1\n00:00:01,000 --> 00:00:02,000\nCue\n".utf8).write(to: sidecar)
+        let descriptor = try XCTUnwrap(ExternalSubtitleService.descriptor(for: sidecar))
+        let step = TranscodePlanner.plan(info: info(), intent: .local).steps[1]
+        let args = try TranscodeService.ffmpegArguments(input: directory.appendingPathComponent("Movie.mkv"),
+            output: directory.appendingPathComponent("out.mp4"), step: step,
+            selection: TrackSelection(audioID: 2, subtitle: .external(descriptor), subtitlePolicy: .includeSelected),
+            sourceHasAudio: true)
+        XCTAssertEqual(args[args.firstIndex(of: "-i")!.advanced(by: 1)], directory.appendingPathComponent("Movie.mkv").path)
+        XCTAssertTrue(args.windows(ofCount: 2).contains { Array($0) == ["-map", "1:0"] })
+        XCTAssertTrue(args.contains("mov_text"))
+        XCTAssertTrue(args.contains(sidecar.path))
     }
 
     func testOmittedSubtitlesAddSn() throws {
@@ -168,6 +196,7 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertTrue(manifest.sourceHadAudio)
         XCTAssertEqual(manifest.selectedAudioID, 5)
         XCTAssertTrue(manifest.requiresHVC1)
+        XCTAssertEqual(manifest.playbackIntent, .local)
     }
 
     func testManifestWriteFailsWhenSourceMissing() throws {
@@ -210,6 +239,150 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertFalse(registry.isCurrent(token, itemID: itemID))
     }
 
+    func testPlaybackPreferencesNormalizeAndRoundTrip() throws {
+        let preferences = PlaybackPreferences(audioLanguages: [" ENG ", "en", "sr-Latn"],
+                                              subtitleLanguages: ["SR", "", "sr"],
+                                              subtitleMode: .preferred)
+        XCTAssertEqual(preferences.preferredAudioLanguages, ["en", "sr-latn"])
+        XCTAssertEqual(preferences.preferredSubtitleLanguages, ["sr"])
+        let data = try JSONEncoder().encode(preferences)
+        XCTAssertEqual(try JSONDecoder().decode(PlaybackPreferences.self, from: data), preferences)
+    }
+
+    func testPlaybackPreferencesCorruptDataFallsBack() {
+        let suite = "AirPlayDropTests.preferences.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(Data("not-json".utf8), forKey: PlaybackPreferencesStore.defaultsKey)
+        XCTAssertEqual(PlaybackPreferencesStore(defaults: defaults).preferences, .systemDefault)
+    }
+
+    func testPreferredSelectionMatchesRegionalLanguagesAndForcedSubtitles() {
+        let tracks = [
+            MediaTrack(id: 0, kind: .video, codec: "h264", language: nil, title: nil,
+                       channels: nil, isDefault: true, isTextSubtitle: false),
+            MediaTrack(id: 1, kind: .audio, codec: "aac", language: "en-US", title: nil,
+                       channels: 2, isDefault: false, isTextSubtitle: false),
+            MediaTrack(id: 2, kind: .audio, codec: "aac", language: "sr", title: nil,
+                       channels: 2, isDefault: true, isTextSubtitle: false),
+            MediaTrack(id: 3, kind: .subtitle, codec: "hdmv_pgs_subtitle", language: "en",
+                       title: nil, channels: nil, isDefault: true, isTextSubtitle: false),
+            MediaTrack(id: 4, kind: .subtitle, codec: "subrip", language: "en-US", title: nil,
+                       channels: nil, isDefault: false, isTextSubtitle: true, isForced: true)
+        ]
+        let info = MediaInfo(formatName: "matroska", duration: 120, videoCodec: "h264",
+                             videoProfile: nil, pixelFormat: nil, colorTransfer: nil,
+                             isDolbyVision: false, tracks: tracks)
+        let selection = FFprobeService.defaultSelection(from: info,
+            preferences: PlaybackPreferences(audioLanguages: ["en"], subtitleLanguages: ["en"], subtitleMode: .forcedPreferred))
+        XCTAssertEqual(selection.audioID, 1)
+        XCTAssertEqual(selection.subtitleID, 4)
+    }
+
+    func testPreferredSelectionCanonicalizesISO639TwoAndThreeLetterCodes() {
+        let tracks = [
+            MediaTrack(id: 0, kind: .video, codec: "h264", language: nil, title: nil,
+                       channels: nil, isDefault: true, isTextSubtitle: false),
+            MediaTrack(id: 1, kind: .audio, codec: "aac", language: "srp", title: nil,
+                       channels: 2, isDefault: true, isTextSubtitle: false),
+            MediaTrack(id: 2, kind: .audio, codec: "aac", language: "eng", title: nil,
+                       channels: 2, isDefault: false, isTextSubtitle: false)
+        ]
+        let media = MediaInfo(formatName: "matroska", duration: 120, videoCodec: "h264",
+                              videoProfile: nil, pixelFormat: nil, colorTransfer: nil,
+                              isDolbyVision: false, tracks: tracks)
+        let selection = FFprobeService.defaultSelection(from: media,
+            preferences: PlaybackPreferences(audioLanguages: ["en"], subtitleLanguages: []))
+        XCTAssertEqual(selection.audioID, 2)
+    }
+
+    func testExternalSubtitleDiscoveryIsLocalAndDeterministic() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let movie = directory.appendingPathComponent("Movie.mkv")
+        try Data("video".utf8).write(to: movie)
+        for name in ["Movie.srt", "Movie.en.srt", "Movie.SR.VTT", "Movie.jpg", "Other.srt"] {
+            try Data("1".utf8).write(to: directory.appendingPathComponent(name))
+        }
+        let descriptors = ExternalSubtitleService.discover(for: movie,
+            preferences: PlaybackPreferences(audioLanguages: [], subtitleLanguages: ["sr"], subtitleMode: .preferred))
+        XCTAssertEqual(descriptors.map(\.displayName), ["Movie.srt", "Movie.SR.VTT", "Movie.en.srt"])
+        XCTAssertEqual(descriptors[1].language, "sr")
+    }
+
+    func testPlaybackHistoryEligibilityAndFingerprint() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("movie.mkv")
+        try Data("one".utf8).write(to: source)
+        let suite = "AirPlayDropTests.history.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = PlaybackHistoryStore(defaults: defaults)
+        XCTAssertTrue(PlaybackHistoryStore.isEligible(position: 30, duration: 120))
+        XCTAssertFalse(PlaybackHistoryStore.isEligible(position: 29, duration: 120))
+        XCTAssertFalse(PlaybackHistoryStore.isEligible(position: 30, duration: 89))
+        store.save(sourceURL: source, position: 30, duration: 120, at: Date(timeIntervalSince1970: 1))
+        XCTAssertNotNil(store.entry(for: source))
+        try Data("replacement".utf8).write(to: source)
+        XCTAssertNil(store.entry(for: source))
+    }
+
+    func testSyncAdjustmentClampsAndZeroPreservesArguments() throws {
+        XCTAssertEqual(SyncAdjustment(audioMilliseconds: 50_000, subtitleMilliseconds: -50_000),
+                       SyncAdjustment(audioMilliseconds: 10_000, subtitleMilliseconds: -10_000))
+        let step = TranscodePlanner.plan(info: info(), intent: .local).steps[1]
+        let selection = TrackSelection(audioID: 2)
+        let standard = try TranscodeService.ffmpegArguments(input: URL(fileURLWithPath: "/in.mkv"),
+            output: URL(fileURLWithPath: "/out.mp4"), step: step, selection: selection, sourceHasAudio: true)
+        let noOp = try TranscodeService.ffmpegArguments(input: URL(fileURLWithPath: "/in.mkv"),
+            output: URL(fileURLWithPath: "/out.mp4"), step: step, selection: selection,
+            sourceHasAudio: true, syncAdjustment: .zero)
+        XCTAssertEqual(standard, noOp)
+        XCTAssertTrue(try TranscodeService.ffmpegArguments(input: URL(fileURLWithPath: "/in.mkv"),
+            output: URL(fileURLWithPath: "/out.mp4"), step: step, selection: selection,
+            sourceHasAudio: true, syncAdjustment: SyncAdjustment(audioMilliseconds: 750)).contains("adelay=750:all=1") )
+        XCTAssertTrue(try TranscodeService.ffmpegArguments(input: URL(fileURLWithPath: "/in.mkv"),
+            output: URL(fileURLWithPath: "/out.mp4"), step: step, selection: selection,
+            sourceHasAudio: true, syncAdjustment: SyncAdjustment(audioMilliseconds: 750),
+            mediaDuration: 120).contains("adelay=750:all=1,atrim=end=120.000"))
+    }
+
+    func testLateNightForcesAudioTranscodeAndThumbnailsQuantize() {
+        let plan = TranscodePlanner.plan(info: info(format: "mp4", video: "h264"), intent: .local,
+                                         audioProcessingMode: .lateNight)
+        XCTAssertEqual(plan.steps.first?.strategy, .audioTranscode)
+        let arguments = try? TranscodeService.ffmpegArguments(input: URL(fileURLWithPath: "/in.mp4"),
+            output: URL(fileURLWithPath: "/out.mp4"), step: plan.steps[0],
+            selection: TrackSelection(audioID: 2), sourceHasAudio: true)
+        XCTAssertTrue(arguments?.contains(AudioProcessingPreset.lateNightFilter) == true)
+        XCTAssertEqual(ThumbnailProvider.quantizedBucket(1.99), 0)
+        XCTAssertEqual(ThumbnailProvider.quantizedBucket(2.0), 1)
+        XCTAssertNil(ThumbnailProvider.quantizedBucket(-1))
+    }
+
+    func testThumbnailProviderCachesAndBoundsEntries() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("preview.mp4")
+        try Data("fixture".utf8).write(to: source)
+        let generator = TestThumbnailGenerator()
+        let provider = ThumbnailProvider { _ in generator }
+        let first = await provider.image(for: source, at: 0)
+        let second = await provider.image(for: source, at: 1.9)
+        XCTAssertNotNil(first)
+        XCTAssertNotNil(second)
+        XCTAssertEqual(generator.count, 1)
+        for index in 1...31 {
+            _ = await provider.image(for: source, at: Double(index * 2))
+        }
+        let entryCount = await provider.cachedEntryCount()
+        XCTAssertEqual(entryCount, 30)
+    }
+
     func testTrackDisplayNameIncludesLanguageCodecAndChannels() {
         let track = MediaTrack(id: 2, kind: .audio, codec: "eac3", language: "eng", title: nil,
             channels: 6, isDefault: true, isTextSubtitle: false)
@@ -234,5 +407,24 @@ private extension Array {
     func windows(ofCount count: Int) -> [ArraySlice<Element>] {
         guard count > 0, count <= self.count else { return [] }
         return indices.dropLast(count - 1).map { self[$0..<(index($0, offsetBy: count))] }
+    }
+}
+
+private final class TestThumbnailGenerator: ThumbnailImageGenerating, @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls = 0
+
+    var count: Int {
+        lock.lock(); defer { lock.unlock() }
+        return calls
+    }
+
+    func image(at time: CMTime, maximumSize: CGSize) throws -> CGImage {
+        lock.lock(); calls += 1; lock.unlock()
+        let provider = CGDataProvider(data: Data([0, 0, 0, 255]) as CFData)!
+        return CGImage(width: 1, height: 1, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: 4, space: CGColorSpaceCreateDeviceRGB(),
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
     }
 }

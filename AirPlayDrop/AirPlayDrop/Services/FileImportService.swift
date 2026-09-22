@@ -25,6 +25,19 @@ struct FileImportService {
         }
     }
 
+    static func openSubtitlePanel(completion: @escaping (URL?) -> Void) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = ExternalSubtitleService.supportedExtensions.compactMap {
+            UTType(filenameExtension: $0)
+        }
+        panel.begin { response in
+            completion(response == .OK ? panel.url : nil)
+        }
+    }
+
     /// Accepts all URLs — actual playability is determined later by AVFoundation.
     static func filter(_ urls: [URL]) -> [URL] {
         urls.filter { $0.isFileURL }

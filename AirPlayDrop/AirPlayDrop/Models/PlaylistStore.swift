@@ -22,6 +22,8 @@ final class PlaylistStore {
     var items: [MediaItem] = []
     var selectedID: UUID?
 
+    let preferencesStore: PlaybackPreferencesStore
+
     var selectedItem: MediaItem? {
         guard let selectedID else { return nil }
         return items.first { $0.id == selectedID }
@@ -29,6 +31,10 @@ final class PlaylistStore {
 
     private var processTasks: [UUID: Task<Void, Never>] = [:]
     private var jobTokens = JobTokenRegistry()
+
+    init(preferencesStore: PlaybackPreferencesStore = PlaybackPreferencesStore()) {
+        self.preferencesStore = preferencesStore
+    }
 
     func add(urls: [URL]) {
         for url in urls where !items.contains(where: { $0.fileURL.standardizedFileURL == url.standardizedFileURL }) {
@@ -99,16 +105,36 @@ final class PlaylistStore {
     }
 
     func chooseSubtitle(_ trackID: Int?, for item: MediaItem) {
-        item.trackSelection.subtitleID = trackID
-        item.trackSelection.subtitlePolicy = trackID == nil ? .omit : .includeSelected
+        chooseSubtitle(trackID.map { .embedded(streamID: $0) } ?? .none, for: item)
+    }
+
+    func chooseSubtitle(_ selection: SubtitleSelection, for item: MediaItem) {
+        item.trackSelection.subtitle = selection
+        item.trackSelection.subtitlePolicy = selection.isNone ? .omit : .includeSelected
         invalidatePreparedArtifact(item)
     }
 
-    private func invalidatePreparedArtifact(_ item: MediaItem) {
+    func attachSubtitle(_ url: URL, to item: MediaItem) -> Bool {
+        guard let descriptor = ExternalSubtitleService.descriptor(for: url), descriptor.isCurrent else { return false }
+        chooseSubtitle(.external(descriptor), for: item)
+        return true
+    }
+
+    func setSyncAdjustment(_ adjustment: SyncAdjustment, for item: MediaItem) {
+        item.syncAdjustment = adjustment
+        invalidatePreparedArtifact(item, reason: "Synchronization changed; prepare the video again.")
+    }
+
+    func setAudioProcessingMode(_ mode: AudioProcessingMode, for item: MediaItem) {
+        item.audioProcessingMode = mode
+        invalidatePreparedArtifact(item, reason: "Audio processing changed; prepare the video again.")
+    }
+
+    private func invalidatePreparedArtifact(_ item: MediaItem, reason: String = "Track selection changed; prepare the video again.") {
         if item.transcodedURL != nil {
             item.transcodedURL = nil
             item.isAirPlayPrepared = false
-            item.preparationReason = "Track selection changed; prepare the video again."
+            item.preparationReason = reason
         }
     }
 
@@ -143,7 +169,20 @@ final class PlaylistStore {
                 guard self.isCurrent(token, for: item), !Task.isCancelled else { return }
                 item.mediaInfo = info
                 item.duration = item.duration ?? info.duration
-                item.trackSelection = FFprobeService.defaultSelection(from: info)
+                if !item.hasAppliedInitialSelection {
+                    item.trackSelection = FFprobeService.defaultSelection(from: info,
+                                                                          preferences: self.preferencesStore.preferences)
+                    let sidecars = ExternalSubtitleService.discover(for: item.fileURL,
+                                                                    preferences: self.preferencesStore.preferences)
+                    if item.trackSelection.subtitle.isNone,
+                       self.preferencesStore.preferences.subtitleDefaultMode == .preferred,
+                       let preferred = ExternalSubtitleService.preferred(sidecars,
+                                                                         preferences: self.preferencesStore.preferences) {
+                        item.trackSelection.subtitle = .external(preferred)
+                        item.trackSelection.subtitlePolicy = .includeSelected
+                    }
+                    item.hasAppliedInitialSelection = true
+                }
             }
 
             if case .unsupported = item.state {
@@ -176,17 +215,25 @@ final class PlaylistStore {
                 else { info = try await FFprobeService.probe(item.fileURL, using: installation) }
                 guard self.isCurrent(token, for: item) else { return }
                 item.mediaInfo = info
-                if item.trackSelection.audioID == nil && info.hasAudio {
-                    item.trackSelection = FFprobeService.defaultSelection(from: info)
+                if !item.hasAppliedInitialSelection {
+                    item.trackSelection = FFprobeService.defaultSelection(from: info,
+                                                                          preferences: self.preferencesStore.preferences)
+                    item.hasAppliedInitialSelection = true
                 }
                 let plan = TranscodePlanner.plan(info: info, intent: intent,
-                    selectedAudioID: item.trackSelection.audioID)
+                    selectedAudioID: item.trackSelection.audioID,
+                    audioProcessingMode: item.audioProcessingMode,
+                    syncAdjustment: item.syncAdjustment,
+                    requiresSubtitleMuxing: item.trackSelection.hasSelectedSubtitle)
                 item.preparationReason = plan.reason
 
                 var cachedURL: URL?
                 for candidate in OutputReservation.existingArtifacts(for: item.fileURL) {
                     let validation = await MediaArtifactValidator.validateCached(candidate, source: item.fileURL,
-                        expectedSelectedAudioID: item.trackSelection.audioID)
+                        expectedSelection: item.trackSelection,
+                        expectedSyncAdjustment: item.syncAdjustment,
+                        expectedAudioProcessingMode: item.audioProcessingMode,
+                        expectedIntent: intent)
                     guard self.isCurrent(token, for: item), !Task.isCancelled else { return }
                     if validation.isValid { cachedURL = candidate; break }
                 }
@@ -197,7 +244,9 @@ final class PlaylistStore {
                     item.state = .ready
                 } else {
                     let artifact = try await TranscodeService.prepare(input: item.fileURL, info: info,
-                        selection: item.trackSelection, intent: intent) { [weak self, weak item] progress in
+                        selection: item.trackSelection, intent: intent,
+                        syncAdjustment: item.syncAdjustment,
+                        audioProcessingMode: item.audioProcessingMode) { [weak self, weak item] progress in
                             Task { @MainActor in
                                 guard let self, let item, self.isCurrent(token, for: item) else { return }
                                 if case .transcoding(let old) = item.state {

@@ -19,6 +19,11 @@ struct MediaArtifactManifest: Codable, Sendable {
     let selectedAudioID: Int?
     let expectedDuration: Double?
     let requiresHVC1: Bool
+    let selectedSubtitle: SubtitleSelection
+    let syncAdjustment: SyncAdjustment
+    let audioProcessingMode: AudioProcessingMode
+    let audioProcessingPresetVersion: Int
+    let playbackIntent: PlaybackIntent
 }
 
 enum MediaArtifactError: LocalizedError {
@@ -45,28 +50,47 @@ enum MediaArtifactValidator {
     }
 
     static func writeManifest(source: URL, artifact: URL, sourceHadAudio: Bool,
-                              selectedAudioID: Int?, expectedDuration: Double?, requiresHVC1: Bool) throws {
+                              selectedAudioID: Int?, expectedDuration: Double?, requiresHVC1: Bool,
+                              selectedSubtitle: SubtitleSelection = .none,
+                              syncAdjustment: SyncAdjustment = .zero,
+                              audioProcessingMode: AudioProcessingMode = .standard,
+                              audioProcessingPresetVersion: Int = AudioProcessingPreset.version,
+                              playbackIntent: PlaybackIntent = .local) throws {
         guard let fingerprint = sourceFingerprint(source) else { throw MediaArtifactError.missingFingerprint }
         guard let outputValues = try? artifact.resourceValues(forKeys: [.fileSizeKey]),
               let outputSize = outputValues.fileSize else { throw MediaArtifactError.missingOutputSize }
-        let manifest = MediaArtifactManifest(schemaVersion: 2, sourcePath: source.standardizedFileURL.path,
+        let manifest = MediaArtifactManifest(schemaVersion: 6, sourcePath: source.standardizedFileURL.path,
             sourceSize: fingerprint.0, sourceModification: fingerprint.1, outputSize: Int64(outputSize),
             sourceHadAudio: sourceHadAudio, selectedAudioID: selectedAudioID,
-            expectedDuration: expectedDuration, requiresHVC1: requiresHVC1)
+            expectedDuration: expectedDuration, requiresHVC1: requiresHVC1,
+            selectedSubtitle: selectedSubtitle, syncAdjustment: syncAdjustment,
+            audioProcessingMode: audioProcessingMode,
+            audioProcessingPresetVersion: audioProcessingPresetVersion,
+            playbackIntent: playbackIntent)
         let data = try JSONEncoder().encode(manifest)
         try data.write(to: manifestURL(for: artifact), options: .atomic)
     }
 
     static func validateCached(_ artifact: URL, source: URL,
-                               expectedSelectedAudioID: Int? = nil) async -> MediaArtifactValidation {
+                               expectedSelectedAudioID: Int? = nil,
+                               expectedSelection: TrackSelection? = nil,
+                               expectedSyncAdjustment: SyncAdjustment = .zero,
+                               expectedAudioProcessingMode: AudioProcessingMode = .standard,
+                               expectedIntent: PlaybackIntent = .local) async -> MediaArtifactValidation {
         guard let data = try? Data(contentsOf: manifestURL(for: artifact)),
               let manifest = try? JSONDecoder().decode(MediaArtifactManifest.self, from: data),
-              manifest.schemaVersion == 2,
+              manifest.schemaVersion == 6,
               manifest.sourcePath == source.standardizedFileURL.path,
               let fingerprint = sourceFingerprint(source),
               manifest.sourceSize == fingerprint.0,
               manifest.sourceModification == fingerprint.1,
-              manifest.selectedAudioID == expectedSelectedAudioID,
+              manifest.selectedAudioID == (expectedSelection?.audioID ?? expectedSelectedAudioID),
+              manifest.selectedSubtitle == (expectedSelection?.subtitle ?? .none),
+              manifest.syncAdjustment == expectedSyncAdjustment,
+              manifest.audioProcessingMode == expectedAudioProcessingMode,
+              manifest.audioProcessingPresetVersion == AudioProcessingPreset.version,
+              manifest.playbackIntent == expectedIntent,
+              (manifest.selectedSubtitle.externalDescriptor == nil || manifest.selectedSubtitle.externalDescriptor?.isCurrent == true),
               let outputValues = try? artifact.resourceValues(forKeys: [.fileSizeKey]),
               Int64(outputValues.fileSize ?? -1) == manifest.outputSize else {
             return MediaArtifactValidation(isValid: false, hasVideo: false, hasAudio: false, duration: nil, reason: "No current artifact manifest")

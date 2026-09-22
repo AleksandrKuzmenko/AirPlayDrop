@@ -29,6 +29,10 @@
 		AB0001000000000000000081 /* FFmpegLocator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000082 /* FFmpegLocator.swift */; };
 		AB0001000000000000000083 /* AirPlayDropTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000084 /* AirPlayDropTests.swift */; };
 		AB0001000000000000000096 /* FFprobeService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000097 /* FFprobeService.swift */; };
+		AB0001000000000000000100 /* PlaybackPreferences.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000101 /* PlaybackPreferences.swift */; };
+		AB0001000000000000000102 /* PlaybackHistoryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000103 /* PlaybackHistoryStore.swift */; };
+		AB0001000000000000000104 /* ExternalSubtitleService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000105 /* ExternalSubtitleService.swift */; };
+		AB0001000000000000000106 /* ThumbnailProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0001000000000000000107 /* ThumbnailProvider.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -75,6 +79,10 @@
 		AB0001000000000000000084 /* AirPlayDropTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AirPlayDropTests.swift; sourceTree = "<group>"; };
 		AB0001000000000000000085 /* AirPlayDropTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AirPlayDropTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		AB0001000000000000000097 /* FFprobeService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FFprobeService.swift; sourceTree = "<group>"; };
+		AB0001000000000000000101 /* PlaybackPreferences.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackPreferences.swift; sourceTree = "<group>"; };
+		AB0001000000000000000103 /* PlaybackHistoryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackHistoryStore.swift; sourceTree = "<group>"; };
+		AB0001000000000000000105 /* ExternalSubtitleService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExternalSubtitleService.swift; sourceTree = "<group>"; };
+		AB0001000000000000000107 /* ThumbnailProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThumbnailProvider.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -122,6 +130,7 @@
 				AB0001000000000000000018 /* MediaItemState.swift */,
 				AB0001000000000000000019 /* PlaylistStore.swift */,
 				AB0001000000000000000079 /* MediaTrack.swift */,
+				AB0001000000000000000101 /* PlaybackPreferences.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -137,6 +146,9 @@
 				AB0001000000000000000077 /* MediaArtifactValidator.swift */,
 				AB0001000000000000000082 /* FFmpegLocator.swift */,
 				AB0001000000000000000097 /* FFprobeService.swift */,
+				AB0001000000000000000103 /* PlaybackHistoryStore.swift */,
+				AB0001000000000000000105 /* ExternalSubtitleService.swift */,
+				AB0001000000000000000107 /* ThumbnailProvider.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -281,6 +293,10 @@
 				AB0001000000000000000078 /* MediaTrack.swift in Sources */,
 				AB0001000000000000000081 /* FFmpegLocator.swift in Sources */,
 				AB0001000000000000000096 /* FFprobeService.swift in Sources */,
+				AB0001000000000000000100 /* PlaybackPreferences.swift in Sources */,
+				AB0001000000000000000102 /* PlaybackHistoryStore.swift in Sources */,
+				AB0001000000000000000104 /* ExternalSubtitleService.swift in Sources */,
+				AB0001000000000000000106 /* ThumbnailProvider.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
