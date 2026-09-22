@@ -1,5 +1,6 @@
 import SwiftUI
 
+@MainActor
 struct TransportBarView: View {
     @Bindable var controller: PlaybackController
 

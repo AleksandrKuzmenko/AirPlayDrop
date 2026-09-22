@@ -4,9 +4,37 @@ on:
   pull_request:
 jobs:
   build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            xcode: /Applications/Xcode_15.4.app
+          - runner: macos-15
+            xcode: default
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Select oldest supported Xcode
+        if: matrix.xcode != 'default'
+        run: sudo xcode-select --switch "${{ matrix.xcode }}"
+      - name: Toolchain
+        run: xcodebuild -version
+      - name: Verify
+        run: ./scripts/verify.sh
+
+  ffmpeg-integration:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - run: xcodebuild -project AirPlayDrop/AirPlayDrop.xcodeproj -scheme AirPlayDrop -configuration Debug -sdk macosx build CODE_SIGNING_ALLOWED=NO
-      - run: xcodebuild -project AirPlayDrop/AirPlayDrop.xcodeproj -scheme AirPlayDrop -destination 'platform=macOS' test CODE_SIGNING_ALLOWED=NO
-      - run: git diff --check
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: sudo xcode-select --switch /Applications/Xcode_15.4.app
+      - name: Install FFmpeg
+        run: brew install ffmpeg
+      - name: Run generated-media integration test
+        run: |
+          xcodebuild \
+            -project AirPlayDrop/AirPlayDrop.xcodeproj \
+            -scheme AirPlayDrop \
+            -destination "platform=macOS,arch=$(uname -m)" \
+            -only-testing:AirPlayDropTests/AirPlayDropTests/testGeneratedMediaPreparationAndCacheValidation \
+            test CODE_SIGNING_ALLOWED=NO

@@ -1,5 +1,6 @@
 import SwiftUI
 
+@MainActor
 struct PlaylistView: View {
     @Bindable var store: PlaylistStore
     let playingItemID: UUID?

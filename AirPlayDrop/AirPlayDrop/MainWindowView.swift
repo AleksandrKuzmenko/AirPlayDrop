@@ -1,6 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+@MainActor
 struct MainWindowView: View {
     @State private var store = PlaylistStore()
     @State private var controller = PlaybackController()
@@ -57,7 +58,7 @@ struct MainWindowView: View {
             controller.prepare(item: store.selectedItem)
         }
         .task {
-            weak let playbackController = controller
+            weak var playbackController = controller
             controller.onPlaybackFailure = { [store] item in
                 store.retranscode(item, for: .local)
             }

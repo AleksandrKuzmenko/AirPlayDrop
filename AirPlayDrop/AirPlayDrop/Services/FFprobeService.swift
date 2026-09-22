@@ -1,4 +1,76 @@
 import Foundation
+import Darwin
+
+private final class ProbeProcess: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
+    private var timedOut = false
+
+    func install(_ process: Process) {
+        lock.lock(); defer { lock.unlock() }
+        self.process = process
+    }
+
+    func terminate(timedOut: Bool = false) {
+        lock.lock()
+        cancelled = true
+        self.timedOut = self.timedOut || timedOut
+        let process = self.process
+        lock.unlock()
+        guard let process, process.isRunning else { return }
+        process.terminate()
+        let pid = process.processIdentifier
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+            if process.isRunning { Darwin.kill(pid, SIGKILL) }
+        }
+    }
+
+    var terminationReason: Error? {
+        lock.lock(); defer { lock.unlock() }
+        if timedOut { return FFprobeError.timedOut }
+        if cancelled { return CancellationError() }
+        return nil
+    }
+}
+
+private final class BoundedProbeOutput: @unchecked Sendable {
+    private let lock = NSLock()
+    private let limit: Int
+    private var data = Data()
+    private var exceededLimit = false
+
+    init(limit: Int) { self.limit = limit }
+
+    func append(_ chunk: Data) {
+        lock.lock(); defer { lock.unlock() }
+        guard !exceededLimit else { return }
+        if data.count + chunk.count > limit {
+            exceededLimit = true
+            data.removeAll(keepingCapacity: false)
+        } else {
+            data.append(chunk)
+        }
+    }
+
+    func snapshot() throws -> Data {
+        lock.lock(); defer { lock.unlock() }
+        if exceededLimit { throw FFprobeError.outputTooLarge }
+        return data
+    }
+}
+
+enum FFprobeError: LocalizedError {
+    case timedOut
+    case outputTooLarge
+
+    var errorDescription: String? {
+        switch self {
+        case .timedOut: return "FFprobe did not finish within 30 seconds."
+        case .outputTooLarge: return "FFprobe returned more metadata than AirPlayDrop can safely process."
+        }
+    }
+}
 
 struct FFprobeStream: Codable, Equatable, Sendable {
     let index: Int
@@ -33,25 +105,73 @@ enum FFprobeService {
     }
 
     static func probe(_ url: URL, using installation: FFmpegInstallation) async throws -> MediaInfo {
-        let data = try await Task.detached {
-            let process = Process()
-            let stdout = Pipe()
-            let stderr = Pipe()
-            process.executableURL = installation.ffprobe
-            process.arguments = ["-v", "error", "-show_streams", "-show_format", "-of", "json", url.path]
-            process.standardOutput = stdout
-            process.standardError = stderr
-            try process.run()
-            let result = stdout.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else {
-                let message = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-                throw NSError(domain: "FFprobe", code: Int(process.terminationStatus),
-                    userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "FFprobe failed" : message])
-            }
-            return result
-        }.value
+        let data = try await runProcess(executable: installation.ffprobe,
+            arguments: ["-v", "error", "-show_streams", "-show_format", "-of", "json", url.path])
         return mediaInfo(from: try parse(data))
+    }
+
+    static func runProcess(executable: URL, arguments: [String], timeout: TimeInterval = 30) async throws -> Data {
+        let holder = ProbeProcess()
+        let stdoutBuffer = BoundedProbeOutput(limit: 8 * 1_024 * 1_024)
+        let stderrBuffer = BoundedProbeOutput(limit: 64 * 1_024)
+
+        return try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { continuation in
+                let process = Process()
+                let stdout = Pipe()
+                let stderr = Pipe()
+                process.executableURL = executable
+                process.arguments = arguments
+                process.standardOutput = stdout
+                process.standardError = stderr
+                holder.install(process)
+
+                stdout.fileHandleForReading.readabilityHandler = { handle in
+                    let data = handle.availableData
+                    if !data.isEmpty { stdoutBuffer.append(data) }
+                }
+                stderr.fileHandleForReading.readabilityHandler = { handle in
+                    let data = handle.availableData
+                    if !data.isEmpty { stderrBuffer.append(data) }
+                }
+
+                let timeoutWork = DispatchWorkItem { holder.terminate(timedOut: true) }
+                process.terminationHandler = { process in
+                    timeoutWork.cancel()
+                    stdout.fileHandleForReading.readabilityHandler = nil
+                    stderr.fileHandleForReading.readabilityHandler = nil
+                    stdoutBuffer.append(stdout.fileHandleForReading.readDataToEndOfFile())
+                    stderrBuffer.append(stderr.fileHandleForReading.readDataToEndOfFile())
+                    do {
+                        if let reason = holder.terminationReason { throw reason }
+                        let output = try stdoutBuffer.snapshot()
+                        let errorData = try stderrBuffer.snapshot()
+                        guard process.terminationStatus == 0 else {
+                            let message = String(decoding: errorData, as: UTF8.self)
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            throw NSError(domain: "FFprobe", code: Int(process.terminationStatus),
+                                userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "FFprobe failed" : message])
+                        }
+                        continuation.resume(returning: output)
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+
+                do {
+                    try process.run()
+                    DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timeoutWork)
+                    if Task.isCancelled { holder.terminate() }
+                } catch {
+                    timeoutWork.cancel()
+                    stdout.fileHandleForReading.readabilityHandler = nil
+                    stderr.fileHandleForReading.readabilityHandler = nil
+                    continuation.resume(throwing: error)
+                }
+            }
+        }, onCancel: {
+            holder.terminate()
+        })
     }
 
     static func mediaInfo(from result: FFprobeResult) -> MediaInfo {

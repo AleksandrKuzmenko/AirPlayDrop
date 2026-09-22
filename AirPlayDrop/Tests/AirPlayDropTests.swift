@@ -135,6 +135,12 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertEqual(args.last, "/out.mp4")
     }
 
+    func testHEVCRemuxUsesHVC1SampleEntry() {
+        let step = TranscodePlanner.plan(info: info(), intent: .local).steps[0]
+        XCTAssertEqual(step.strategy, .remux)
+        XCTAssertTrue(step.videoArguments.windows(ofCount: 2).contains { Array($0) == ["-tag:v", "hvc1"] })
+    }
+
     func testProgressParserSupportsMicroseconds() {
         XCTAssertEqual(TranscodeService.parseOutTime("out_time_us=2500000"), 2.5)
         XCTAssertEqual(TranscodeService.parseOutTime("out_time=01:02:03.5"), 3723.5)
@@ -164,6 +170,63 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertEqual(mapped.audioTracks.first?.id, 3)
         XCTAssertTrue(mapped.isHDR)
         XCTAssertTrue(mapped.isDolbyVision)
+    }
+
+    func testProbeProcessDrainsLargeStderrWithoutHanging() async {
+        do {
+            _ = try await FFprobeService.runProcess(executable: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "/usr/bin/yes diagnostic | /usr/bin/head -c 70000 >&2; printf '{}'"])
+            XCTFail("Oversized diagnostics unexpectedly succeeded")
+        } catch FFprobeError.outputTooLarge {
+            // Expected: stderr is drained concurrently and bounded.
+        } catch {
+            XCTFail("Expected outputTooLarge, got \(error)")
+        }
+    }
+
+    func testProbeProcessCancellationTerminatesChild() async {
+        let task = Task {
+            try await FFprobeService.runProcess(executable: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "sleep 10"])
+        }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Cancelled probe unexpectedly succeeded")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+    }
+
+    func testGeneratedMediaPreparationAndCacheValidation() async throws {
+        guard let installation = FFmpegLocator.locate() else {
+            throw XCTSkip("FFmpeg integration test requires separately installed ffmpeg and ffprobe")
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("generated.mkv")
+
+        _ = try await FFprobeService.runProcess(executable: installation.ffmpeg, arguments: [
+            "-y", "-f", "lavfi", "-i", "color=c=blue:s=320x180:d=1",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-shortest",
+            "-c:v", "mpeg4", "-c:a", "aac", source.path
+        ], timeout: 60)
+
+        let info = try await FFprobeService.probe(source, using: installation)
+        let selection = FFprobeService.defaultSelection(from: info)
+        let artifact = try await TranscodeService.prepare(input: source, info: info,
+            selection: selection, intent: .local, progress: { _ in })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: artifact.url.path))
+
+        let validation = await MediaArtifactValidator.validateCached(artifact.url, source: source,
+            expectedSelection: selection, expectedIntent: .local)
+        XCTAssertTrue(validation.isValid, validation.reason ?? "Generated artifact was rejected")
+        XCTAssertTrue(validation.hasVideo)
+        XCTAssertTrue(validation.hasAudio)
     }
 
     func testPreferredAudioUsesDefaultInPreferredLanguageFirst() {

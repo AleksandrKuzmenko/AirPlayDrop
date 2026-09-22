@@ -276,7 +276,8 @@ enum TranscodePlanner {
         if ["h264", "hevc"].contains(video) {
             if audioProcessingMode == .standard && syncAdjustment.audioMilliseconds == 0 && (audio == "aac" || audio == nil) {
                 steps.append(ConversionStep(strategy: .remux, reason: "Repackage compatible streams without quality loss.",
-                    videoArguments: ["-c:v", "copy"], audioArguments: ["-c:a", "copy"], requiresHVC1: video == "hevc",
+                    videoArguments: ["-c:v", "copy"] + (video == "hevc" ? ["-tag:v", "hvc1"] : []),
+                    audioArguments: ["-c:a", "copy"], requiresHVC1: video == "hevc",
                     audioProcessingMode: audioProcessingMode))
             }
             steps.append(ConversionStep(strategy: .audioTranscode, reason: "Keep compatible video and convert the selected audio track to AAC.",
