@@ -17,6 +17,37 @@ final class AirPlayDropTests: XCTestCase {
             isDolbyVision: dolbyVision, tracks: tracks)
     }
 
+    func testFFprobeHDRInfoTriggersAirPlayPreparationWithoutAVFoundationFlags() {
+        // An HDR/DV MKV is not openable by AVFoundation, so formatFlags stays
+        // empty and only FFprobe knows the stream is HDR. A locally prepared
+        // copy must still be re-prepared before AirPlay playback.
+        let item = MediaItem(fileURL: URL(fileURLWithPath: "/tmp/Movie.mkv"))
+        item.mediaInfo = info(hdr: true, dolbyVision: true)
+        item.transcodedURL = URL(fileURLWithPath: "/tmp/Movie_airplay.mp4")
+        item.isAirPlayPrepared = false
+        XCTAssertTrue(item.formatFlags.isEmpty)
+        XCTAssertEqual(item.effectiveFormatFlags, [.dolbyVision, .hdr10])
+        XCTAssertTrue(item.needsAirPlayTranscode)
+        XCTAssertEqual(item.formatTag, "DV")
+
+        item.isAirPlayPrepared = true
+        XCTAssertFalse(item.needsAirPlayTranscode)
+    }
+
+    func testSDRInfoDoesNotTriggerAirPlayPreparation() {
+        let item = MediaItem(fileURL: URL(fileURLWithPath: "/tmp/Movie.mkv"))
+        item.mediaInfo = info(hdr: false)
+        XCTAssertFalse(item.needsAirPlayTranscode)
+        XCTAssertNil(item.formatTag)
+    }
+
+    func testHLGInfoMapsToHLGFlag() {
+        let hlg = MediaInfo(formatName: "matroska,webm", duration: 10, videoCodec: "hevc",
+            videoProfile: "Main 10", pixelFormat: "yuv420p10le", colorTransfer: "arib-std-b67",
+            isDolbyVision: false, tracks: [])
+        XCTAssertEqual(hlg.formatFlags, [.hlg])
+    }
+
     func testOutputReservationKeepsMP4ExtensionAndAvoidsCollision() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -61,7 +92,7 @@ final class AirPlayDropTests: XCTestCase {
     func testMatroskaUsesTypedFallbacks() {
         let plan = TranscodePlanner.plan(info: info(), intent: .local)
         XCTAssertEqual(plan.steps.first?.strategy, .remux)
-        XCTAssertEqual(plan.steps.last?.strategy, .softwareEncode)
+        XCTAssertEqual(plan.steps.last?.strategy, .hardwareEncode)
     }
 
     func testDolbyVisionAirPlayStartsWithHDRRemux() {
@@ -71,9 +102,9 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertTrue(plan.reason.contains("Dolby Vision"))
     }
 
-    func testUnsupportedVideoIncludesHardwareAndSoftwareFallbacks() {
+    func testUnsupportedVideoUsesAppleHardwareEncoding() {
         let strategies = TranscodePlanner.plan(info: info(video: "av1", audio: "opus"), intent: .airPlay).steps.map(\.strategy)
-        XCTAssertEqual(strategies, [.hardwareEncode, .softwareEncode])
+        XCTAssertEqual(strategies, [.hardwareEncode])
     }
 
     func testExplicitAudioMappingUsesAbsoluteStreamIndex() throws {
@@ -170,6 +201,44 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertEqual(mapped.audioTracks.first?.id, 3)
         XCTAssertTrue(mapped.isHDR)
         XCTAssertTrue(mapped.isDolbyVision)
+    }
+
+    // The side-data fixtures below are verbatim FFprobe 9.0.2 JSON from tiny
+    // clips generated with the lavfi testsrc2 source (no user media). FFprobe
+    // emits numeric values here, which previously failed the entire decode.
+
+    func testProbeParsesNumericRotationSideData() throws {
+        let data = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","profile":"Main 10","pix_fmt":"yuv420p10le","side_data_list":[{"side_data_type":"Display Matrix","displaymatrix":"\n00000000:            0      -65536           0\n00000001:        65536           0           0\n00000002:            0           0  1073741824\n","rotation":90}],"disposition":{"default":1,"forced":0}}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"1.000000"}}"#.data(using: .utf8)!
+        let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))
+        XCTAssertEqual(mapped.rotation, 90)
+        XCTAssertFalse(mapped.isDolbyVision)
+        XCTAssertEqual(mapped.videoCodec, "hevc")
+    }
+
+    func testProbeParsesNumericHDRLightLevelSideData() throws {
+        let data = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","profile":"Main 10","pix_fmt":"yuv420p10le","color_transfer":"smpte2084","side_data_list":[{"side_data_type":"Mastering display metadata","red_x":"34000/50000","red_y":"16000/50000","green_x":"13250/50000","green_y":"34500/50000","blue_x":"7500/50000","blue_y":"3000/50000","white_point_x":"15635/50000","white_point_y":"16450/50000","min_luminance":"1/10000","max_luminance":"10000000/10000"},{"side_data_type":"Content light level metadata","max_content":1000,"max_average":400}],"disposition":{"default":1,"forced":0}}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"1.000000"}}"#.data(using: .utf8)!
+        let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))
+        XCTAssertTrue(mapped.isHDR)
+        XCTAssertFalse(mapped.isDolbyVision)
+        XCTAssertNil(mapped.rotation)
+    }
+
+    func testProbeParsesDolbyVisionConfigurationProfile() throws {
+        // Field names and types match ffprobe.c print_int/print_str output
+        // for AV_PKT_DATA_DOVI_CONF.
+        let data = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","profile":"Main 10","pix_fmt":"yuv420p10le","color_transfer":"smpte2084","side_data_list":[{"side_data_type":"DOVI configuration record","dv_version_major":1,"dv_version_minor":0,"dv_profile":5,"dv_level":6,"rpu_present_flag":1,"el_present_flag":0,"bl_present_flag":1,"dv_bl_signal_compatibility_id":0,"dv_md_compression":"none"}],"disposition":{"default":1}}],"format":{"format_name":"matroska,webm","duration":"10.0"}}"#.data(using: .utf8)!
+        let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))
+        XCTAssertTrue(mapped.isDolbyVision)
+        XCTAssertEqual(mapped.dolbyVisionProfile, 5)
+        XCTAssertEqual(mapped.dolbyVisionCompatibilityID, 0)
+    }
+
+    func testProbeToleratesUnexpectedSideDataFieldTypes() throws {
+        let data = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","side_data_list":[{"side_data_type":7,"rotation":"ninety","dv_profile":"eight"}]}],"format":{"format_name":"mp4","duration":"1.0"}}"#.data(using: .utf8)!
+        let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))
+        XCTAssertEqual(mapped.videoCodec, "h264")
+        XCTAssertNil(mapped.rotation)
+        XCTAssertNil(mapped.dolbyVisionProfile)
     }
 
     func testProbeProcessDrainsLargeStderrWithoutHanging() async {
@@ -283,6 +352,24 @@ final class AirPlayDropTests: XCTestCase {
         defaults.set(directory.path, forKey: FFmpegLocator.configuredDirectoryKey)
         XCTAssertEqual(FFmpegLocator.locate(defaults: defaults, environment: [:])?.ffmpeg.deletingLastPathComponent().standardizedFileURL,
             directory.standardizedFileURL)
+    }
+
+    func testBundledFFmpegIsUsedWithoutExternalInstallation() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for name in ["ffmpeg", "ffprobe"] {
+            let url = directory.appendingPathComponent(name)
+            try Data("#!/bin/sh\n".utf8).write(to: url)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
+        let suite = "AirPlayDropTests.\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let installation = FFmpegLocator.locate(defaults: defaults, environment: [:], bundledDirectory: directory)
+        XCTAssertEqual(installation?.ffmpeg.deletingLastPathComponent().standardizedFileURL,
+                       directory.standardizedFileURL)
     }
 
     func testJobRegistryRejectsStaleCompletion() {

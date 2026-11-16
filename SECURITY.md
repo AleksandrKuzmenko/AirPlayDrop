@@ -16,6 +16,6 @@ The maintainer will aim to acknowledge a complete report within seven days, keep
 
 ## Security model
 
-AirPlayDrop processes user-selected local files and launches separately installed FFmpeg and FFprobe binaries using structured argument arrays. It does not execute shell command text, bundle multimedia binaries, upload media, include analytics, or operate a network service.
+AirPlayDrop processes user-selected local files and launches bundled FFmpeg and FFprobe binaries using structured argument arrays. The bundled build has FFmpeg network protocols disabled. AirPlayDrop does not execute shell command text, upload media, include analytics, or operate a network service.
 
-Only configure an FFmpeg directory you trust. A malicious executable named `ffmpeg` or `ffprobe` in a configured directory or inherited `PATH` runs with the current user's permissions.
+The explicit FFmpeg-directory setting takes precedence over the bundled tools. Only configure a directory you trust: a malicious executable named `ffmpeg` or `ffprobe` there runs with the current user's permissions. If there is no explicit override or bundled copy, the development fallback searches inherited `PATH` and standard installation directories.

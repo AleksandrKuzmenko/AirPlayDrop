@@ -61,12 +61,25 @@ struct MediaInfo: Codable, Equatable, Sendable {
     let colorTransfer: String?
     let isDolbyVision: Bool
     let tracks: [MediaTrack]
+    /// Dolby Vision profile from the DOVI configuration record (for example 5, 7, or 8).
+    var dolbyVisionProfile: Int? = nil
+    /// Base-layer signal compatibility ID; 0 means no HDR10/SDR-compatible base layer.
+    var dolbyVisionCompatibilityID: Int? = nil
+    /// Display-matrix rotation in degrees, when present.
+    var rotation: Double? = nil
 
     var audioTracks: [MediaTrack] { tracks.filter { $0.kind == .audio } }
     var subtitleTracks: [MediaTrack] { tracks.filter { $0.kind == .subtitle } }
     var hasAudio: Bool { !audioTracks.isEmpty }
     var isHDR: Bool {
         isDolbyVision || colorTransfer == "smpte2084" || colorTransfer == "arib-std-b67"
+    }
+    var formatFlags: Set<VideoFormatFlag> {
+        var flags: Set<VideoFormatFlag> = []
+        if isDolbyVision { flags.insert(.dolbyVision) }
+        if colorTransfer == "smpte2084" { flags.insert(.hdr10) }
+        if colorTransfer == "arib-std-b67" { flags.insert(.hlg) }
+        return flags
     }
 }
 
@@ -171,7 +184,7 @@ enum PlaybackIntent: String, Codable, CaseIterable, Sendable {
 }
 
 enum ConversionStrategy: String, Codable, Sendable {
-    case directPlay, remux, audioTranscode, hdrRemux, hardwareEncode, softwareEncode
+    case directPlay, remux, audioTranscode, hdrRemux, hardwareEncode
 }
 
 enum AudioProcessingMode: String, Codable, CaseIterable, Sendable {
@@ -294,10 +307,6 @@ enum TranscodePlanner {
         }
         steps.append(ConversionStep(strategy: .hardwareEncode, reason: "Use Apple hardware encoding for broad playback compatibility.",
             videoArguments: ["-c:v", "h264_videotoolbox", "-b:v", "5000k"],
-            audioArguments: ["-c:a", "aac", "-ac:a", "2", "-b:a", "192k"], requiresHVC1: false,
-            audioProcessingMode: audioProcessingMode))
-        steps.append(ConversionStep(strategy: .softwareEncode, reason: "Use the software encoder if hardware encoding is unavailable.",
-            videoArguments: ["-c:v", "libx264", "-preset", "fast", "-crf", "20"],
             audioArguments: ["-c:a", "aac", "-ac:a", "2", "-b:a", "192k"], requiresHVC1: false,
             audioProcessingMode: audioProcessingMode))
         return ConversionPlan(intent: intent, steps: steps, reason: "Prepare a compatible MP4 using the least destructive available strategy.")

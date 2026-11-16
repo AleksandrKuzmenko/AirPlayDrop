@@ -25,13 +25,21 @@ final class MediaItem: Identifiable, @unchecked Sendable {
     /// produce an MP4 while retaining Dolby Vision RPU data, an `hev1` sample
     /// entry, or other stream metadata that Apple TV cannot consume.
     var needsAirPlayTranscode: Bool {
-        !isAirPlayPrepared && !formatFlags.isEmpty
+        !isAirPlayPrepared && !effectiveFormatFlags.isEmpty
+    }
+
+    /// HDR/DV markers from AVFoundation combined with those from FFprobe.
+    /// AVFoundation inspects only sources it can open, so containers such as
+    /// MKV report their HDR/DV status through FFprobe alone.
+    var effectiveFormatFlags: Set<VideoFormatFlag> {
+        formatFlags.union(mediaInfo?.formatFlags ?? [])
     }
 
     var formatTag: String? {
-        if formatFlags.contains(.dolbyVision) { return "DV" }
-        if formatFlags.contains(.hdr10)       { return "HDR" }
-        if formatFlags.contains(.hlg)         { return "HLG" }
+        let flags = effectiveFormatFlags
+        if flags.contains(.dolbyVision) { return "DV" }
+        if flags.contains(.hdr10)       { return "HDR" }
+        if flags.contains(.hlg)         { return "HLG" }
         return nil
     }
 

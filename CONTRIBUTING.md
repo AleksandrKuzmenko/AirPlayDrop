@@ -4,10 +4,10 @@ Thanks for helping improve AirPlayDrop. The project is a native macOS applicatio
 
 ## Setup
 
-1. Install Xcode 15.4 or later and select its command-line tools.
-2. Install FFmpeg with `brew install ffmpeg` if you are working on probing or preparation behavior.
-3. Clone the repository and open `AirPlayDrop/AirPlayDrop.xcodeproj`.
-4. Select the AirPlayDrop scheme and run it on My Mac.
+1. Use an Apple-silicon Mac with macOS 14 or later.
+2. Install Xcode 15.4 or later and select its command-line tools.
+3. Clone the repository and run `./scripts/build-bundled-ffmpeg.sh` if you are working on probing, preparation, or distribution behavior.
+4. Open `AirPlayDrop/AirPlayDrop.xcodeproj`, select the AirPlayDrop scheme, and run it on My Mac.
 
 ## Making changes
 
@@ -18,6 +18,7 @@ Thanks for helping improve AirPlayDrop. The project is a native macOS applicatio
 - Add deterministic generated-fixture integration coverage for FFmpeg-facing changes when practical.
 - Never commit copyrighted or personal media, credentials, signing material, DerivedData, or user-specific Xcode files.
 - Keep macOS 14 and Xcode 15.4 compatibility unless a version change is explicitly discussed and documented.
+- Do not enable FFmpeg GPL or nonfree components in a redistributable build.
 
 ## Verification
 

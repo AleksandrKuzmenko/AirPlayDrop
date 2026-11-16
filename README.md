@@ -1,14 +1,14 @@
 # AirPlayDrop
 
-AirPlayDrop is a native macOS utility for playing local video and preparing difficult media for reliable playback on Apple TV through AirPlay. It inspects each file, keeps compatible streams whenever possible, and uses a separately installed FFmpeg only when conversion or repackaging is required.
+AirPlayDrop is a native Apple-silicon macOS utility for playing local video and preparing difficult media for reliable playback on Apple TV through AirPlay. It inspects each file, keeps compatible streams whenever possible, and uses its bundled FFmpeg only when conversion or repackaging is required.
 
-The project is currently a **source-first 0.1.0 alpha**. It is intended for technically comfortable macOS users and contributors; signed and notarized application downloads are not available yet.
+The project is currently a **0.1.x alpha**. The release process produces an arm64-only, Developer ID-signed and Apple-notarized DMG; source builds remain supported for contributors.
 
 ## Features
 
 - Drag-and-drop playlist and native macOS playback controls.
 - AirPlay route selection and an explicit **Prepare for Apple TV / AirPlay** workflow.
-- Media probing before conversion, with named remux, audio-conversion, hardware-encode, and software fallback strategies.
+- Media probing before conversion, with named remux, audio-conversion, and Apple VideoToolbox hardware-encode strategies.
 - Per-file audio-track and text-subtitle selection.
 - Preferred audio and subtitle languages for newly imported files.
 - Automatic discovery and manual attachment of external `.srt`, `.vtt`, `.ass`, and `.ssa` subtitles.
@@ -22,16 +22,16 @@ AirPlayDrop does not implement Chromecast, a phone remote, subtitle OCR, Atmos p
 ## Requirements
 
 - macOS 14 Sonoma or later.
+- A Mac with Apple silicon (M1 or later). Intel Macs are not supported.
 - Xcode 15.4 or later for source builds.
-- FFmpeg and FFprobe installed separately.
 
-The easiest dependency installation is Homebrew:
+Release DMGs include a minimal-dependency, arm64 FFmpeg/FFprobe build. No Homebrew installation is required. A source checkout can build the same pinned toolchain with:
 
 ```sh
-brew install ffmpeg
+./scripts/build-bundled-ffmpeg.sh
 ```
 
-AirPlayDrop searches `PATH`, `/opt/homebrew/bin`, `/usr/local/bin`, and `/usr/bin`. If the tools are elsewhere, open **AirPlayDrop → Settings** or click **FFmpeg Settings** in the toolbar, choose the directory containing both executables, and run the built-in version check.
+AirPlayDrop prefers an explicitly configured FFmpeg directory, then the tools bundled inside the app, followed by `PATH` and standard package-manager locations. The override under **AirPlayDrop → Settings** is useful for development or testing another trusted build.
 
 ## Build and run
 
@@ -76,20 +76,19 @@ Media never leaves the Mac through AirPlayDrop itself. The app does not contain 
 
 For resume playback, AirPlayDrop stores a bounded history of up to 100 local file identities and playback positions in macOS application preferences. Prepared-copy manifests contain source fingerprints and selected preparation options and remain beside the prepared video. Anyone receiving a copied manifest may be able to infer the original filename or folder structure, so omit `.airplay.json` files when sharing prepared videos.
 
-FFmpeg and FFprobe are separate programs executed locally with structured argument arrays. Their licensing and enabled codecs depend on the installation selected by the user.
+FFmpeg and FFprobe are separate programs executed locally with structured argument arrays. Release builds bundle a pinned LGPL build with no GPL/nonfree components or network support. Its notices are inside the app and the corresponding source archive is published with each DMG. A user-configured external build may have different licensing and capabilities.
 
 ## Troubleshooting
 
 ### FFmpeg is not found
 
-Confirm both commands work in Terminal:
+The signed release includes both tools. If a development build cannot find them, build the pinned copies:
 
 ```sh
-ffmpeg -version
-ffprobe -version
+./scripts/build-bundled-ffmpeg.sh
 ```
 
-Then use **FFmpeg Settings** to select their common directory and run the version check.
+Alternatively, use **FFmpeg Settings** to select a trusted directory containing `ffmpeg` and `ffprobe`, then run the version check.
 
 ### Audio plays but video is black on Apple TV
 
@@ -113,13 +112,13 @@ Run the complete local verification gate from the repository root:
 
 The script runs the unsigned Debug build, all unit tests, and `git diff --check`. Tests use generated fixtures and mocks; copyrighted or personal media must never be committed.
 
-The project has no Swift package dependencies. It links Apple AVFoundation and AVKit and expects FFmpeg/FFprobe at runtime for probing and preparation.
+The project has no Swift package dependencies. It links Apple AVFoundation and AVKit. Packaged releases include the pinned FFmpeg/FFprobe runtime; ordinary Xcode debug builds can use either that locally built runtime or a trusted external installation.
 
 ## Distribution
 
-The alpha is distributed as source only. See [AirPlayDrop/docs/DISTRIBUTION.md](AirPlayDrop/docs/DISTRIBUTION.md) for the signing, notarization, architecture, checksum, and multimedia-licensing requirements that apply before binary distribution.
+See [AirPlayDrop/docs/DISTRIBUTION.md](AirPlayDrop/docs/DISTRIBUTION.md) for the Apple-silicon packaging, signing, notarization, checksum, and FFmpeg licensing procedure.
 
-Version tags create immutable source archives and SHA-256 checksums through GitHub Actions. Unsigned application bundles are intentionally not published.
+Release assets include the signed and notarized arm64 DMG, its SHA-256 checksum, and the exact FFmpeg source archive and checksum required to reproduce the bundled LGPL binaries. Unsigned application bundles are not published.
 
 ## Contributing and security
 
