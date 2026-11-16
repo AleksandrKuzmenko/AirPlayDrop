@@ -6,7 +6,7 @@ Thanks for helping improve AirPlayDrop. The project is a native macOS applicatio
 
 1. Use an Apple-silicon Mac with macOS 14 or later.
 2. Install Xcode 15.4 or later and select its command-line tools.
-3. Clone the repository and run `./scripts/build-bundled-ffmpeg.sh` if you are working on probing, preparation, or distribution behavior.
+3. Clone the repository and run `./scripts/build-bundled-ffmpeg.sh` if you are working on probing, preparation, or distribution behavior. The script needs `meson`, `ninja`, and `pkg-config` to build dav1d (`brew install meson ninja pkgconf`).
 4. Open `AirPlayDrop/AirPlayDrop.xcodeproj`, select the AirPlayDrop scheme, and run it on My Mac.
 
 ## Making changes

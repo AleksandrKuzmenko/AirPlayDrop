@@ -26,10 +26,11 @@ xcodebuild \
 
 app="$derived_data/Build/Products/Release/AirPlayDrop.app"
 resources="$app/Contents/Resources"
-mkdir -p "$resources/bin" "$resources/Licenses/FFmpeg"
+mkdir -p "$resources/bin" "$resources/Licenses/FFmpeg" "$resources/Licenses/dav1d"
 cp "$ffmpeg_root/bin/ffmpeg" "$ffmpeg_root/bin/ffprobe" "$resources/bin/"
 cp "$ffmpeg_root/licenses/FFmpeg-LGPL-2.1.txt" "$ffmpeg_root/licenses/FFmpeg-LICENSE.md" \
   "$resources/Licenses/FFmpeg/"
+cp "$ffmpeg_root/licenses/dav1d-COPYING.txt" "$resources/Licenses/dav1d/COPYING.txt"
 cp "$repo_root/THIRD_PARTY_NOTICES.md" "$resources/"
 
 if [ -z "$identity" ]; then

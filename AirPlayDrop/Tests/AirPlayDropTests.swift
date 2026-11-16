@@ -17,6 +17,49 @@ final class AirPlayDropTests: XCTestCase {
             isDolbyVision: dolbyVision, tracks: tracks)
     }
 
+    func testParseDecoderNamesReadsFFmpegDecoderTable() {
+        let text = """
+        Decoders:
+         V..... = Video
+         A..... = Audio
+         ------
+         V....D av1                  Alliance for Open Media AV1
+         V....D libdav1d             dav1d AV1 decoder by VideoLAN (codec av1)
+         VFS..D hevc                 HEVC (High Efficiency Video Coding)
+         A....D truehd               TrueHD
+        """
+        let names = TranscodeService.parseDecoderNames(text)
+        XCTAssertEqual(names, ["av1", "libdav1d", "hevc", "truehd"])
+    }
+
+    func testAV1PrefersSoftwareDecoderThenHardwareAccelerator() throws {
+        XCTAssertEqual(try TranscodeService.inputDecoderArguments(videoCodec: "av1",
+            hasSoftwareAV1Decoder: true, hasHardwareAV1Decoder: true), [])
+        XCTAssertEqual(try TranscodeService.inputDecoderArguments(videoCodec: "av1",
+            hasSoftwareAV1Decoder: false, hasHardwareAV1Decoder: true), ["-hwaccel", "videotoolbox"])
+        XCTAssertThrowsError(try TranscodeService.inputDecoderArguments(videoCodec: "av1",
+            hasSoftwareAV1Decoder: false, hasHardwareAV1Decoder: false)) { error in
+            guard case TranscodeError.av1DecoderUnavailable = error else {
+                return XCTFail("Expected av1DecoderUnavailable, got \(error)")
+            }
+        }
+        XCTAssertEqual(try TranscodeService.inputDecoderArguments(videoCodec: "hevc",
+            hasSoftwareAV1Decoder: false, hasHardwareAV1Decoder: false), [])
+    }
+
+    func testInputDecoderArgumentsPrecedeSourceInput() throws {
+        let step = TranscodePlanner.plan(info: info(video: "av1"), intent: .airPlay, selectedAudioID: 2).steps.last!
+        let args = try TranscodeService.ffmpegArguments(input: URL(fileURLWithPath: "/in.mkv"),
+            output: URL(fileURLWithPath: "/out.mp4"), step: step,
+            selection: TrackSelection(audioID: 2), sourceHasAudio: true,
+            inputArguments: ["-hwaccel", "videotoolbox"])
+        let hwaccel = try XCTUnwrap(args.firstIndex(of: "-hwaccel"))
+        let input = try XCTUnwrap(args.firstIndex(of: "-i"))
+        XCTAssertEqual(args[hwaccel + 1], "videotoolbox")
+        XCTAssertLessThan(hwaccel, input)
+        XCTAssertEqual(args[input + 1], "/in.mkv")
+    }
+
     func testFFprobeHDRInfoTriggersAirPlayPreparationWithoutAVFoundationFlags() {
         // An HDR/DV MKV is not openable by AVFoundation, so formatFlags stays
         // empty and only FFprobe knows the stream is HDR. A locally prepared

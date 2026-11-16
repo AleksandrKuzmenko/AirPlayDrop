@@ -23,3 +23,15 @@ application under `Contents/Resources/Licenses/FFmpeg`.
 
 FFmpeg is a trademark of Fabrice Bellard, originator of the FFmpeg project.
 AirPlayDrop is not affiliated with or endorsed by the FFmpeg project.
+
+## dav1d 1.5.4
+
+The bundled `ffmpeg` and `ffprobe` statically include dav1d, the VideoLAN AV1
+decoder, so AV1 video can be decoded on every supported Mac. dav1d is licensed
+under the BSD 2-Clause License, copyright © 2018-2025 VideoLAN and dav1d
+authors. Its license text is included inside the application under
+`Contents/Resources/Licenses/dav1d`.
+
+Source: https://downloads.videolan.org/pub/videolan/dav1d/1.5.4/dav1d-1.5.4.tar.xz
+
+SHA-256: `686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5`

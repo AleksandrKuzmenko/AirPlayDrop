@@ -11,33 +11,80 @@ source_archive="$download_dir/ffmpeg-${ffmpeg_version}.tar.xz"
 source_dir="$work_root/ffmpeg-${ffmpeg_version}"
 install_dir="${1:-$work_root/ffmpeg-arm64}"
 
+# dav1d provides software AV1 decoding. FFmpeg's built-in AV1 decoder only
+# works with a hardware accelerator, and Apple silicon before M3 has none.
+dav1d_version="1.5.4"
+dav1d_sha256="686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5"
+dav1d_url="https://downloads.videolan.org/pub/videolan/dav1d/${dav1d_version}/dav1d-${dav1d_version}.tar.xz"
+dav1d_archive="$download_dir/dav1d-${dav1d_version}.tar.xz"
+dav1d_source_dir="$work_root/dav1d-${dav1d_version}"
+dav1d_build_dir="$work_root/dav1d-${dav1d_version}-build-arm64"
+dav1d_prefix="$work_root/dav1d-${dav1d_version}-arm64"
+
 case "$(uname -m)" in
   arm64) ;;
   *) echo "Bundled FFmpeg must be built natively on Apple Silicon." >&2; exit 1 ;;
 esac
 
+for tool in meson ninja pkg-config; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "$tool is required to build dav1d. Install it with: brew install meson ninja pkgconf" >&2
+    exit 1
+  fi
+done
+
+verify_sha256() {
+  actual_sha=$(shasum -a 256 "$1" | awk '{print $1}')
+  if [ "$actual_sha" != "$2" ]; then
+    echo "Source checksum mismatch for $1: $actual_sha" >&2
+    exit 1
+  fi
+}
+
 mkdir -p "$download_dir"
 if [ ! -f "$source_archive" ]; then
   curl --fail --location --proto '=https' --tlsv1.2 --output "$source_archive" "$source_url"
 fi
-actual_sha=$(shasum -a 256 "$source_archive" | awk '{print $1}')
-if [ "$actual_sha" != "$ffmpeg_sha256" ]; then
-  echo "FFmpeg source checksum mismatch: $actual_sha" >&2
-  exit 1
+verify_sha256 "$source_archive" "$ffmpeg_sha256"
+if [ ! -f "$dav1d_archive" ]; then
+  curl --fail --location --proto '=https' --tlsv1.2 --output "$dav1d_archive" "$dav1d_url"
 fi
+verify_sha256 "$dav1d_archive" "$dav1d_sha256"
 
 if [ ! -x "$source_dir/configure" ]; then
   mkdir -p "$source_dir"
   tar -xJf "$source_archive" --strip-components=1 -C "$source_dir"
 fi
+if [ ! -f "$dav1d_source_dir/meson.build" ]; then
+  mkdir -p "$dav1d_source_dir"
+  tar -xJf "$dav1d_archive" --strip-components=1 -C "$dav1d_source_dir"
+fi
+
+sdk_root=$(xcrun --sdk macosx --show-sdk-path)
+
+rm -rf "$dav1d_build_dir" "$dav1d_prefix"
+CC="$(xcrun --sdk macosx --find clang)" meson setup "$dav1d_build_dir" "$dav1d_source_dir" \
+  --prefix="$dav1d_prefix" \
+  --libdir=lib \
+  --buildtype=release \
+  --default-library=static \
+  -Denable_tools=false \
+  -Denable_tests=false \
+  -Denable_examples=false \
+  -Denable_docs=false \
+  -Dc_args="-arch arm64 -isysroot $sdk_root -mmacosx-version-min=14.0" \
+  -Dc_link_args="-arch arm64 -isysroot $sdk_root -mmacosx-version-min=14.0"
+ninja -C "$dav1d_build_dir"
+ninja -C "$dav1d_build_dir" install
+PKG_CONFIG_PATH="$dav1d_prefix/lib/pkgconfig"
+export PKG_CONFIG_PATH
 
 build_dir="$work_root/ffmpeg-${ffmpeg_version}-build-arm64"
+# Start from an empty directory: `make distclean` leaves dependency files in
+# nested source folders, which break the build after an Xcode SDK update.
+rm -rf "$build_dir"
 mkdir -p "$build_dir" "$install_dir"
 cd "$build_dir"
-if [ -f Makefile ]; then
-  make distclean
-fi
-sdk_root=$(xcrun --sdk macosx --show-sdk-path)
 
 "$source_dir/configure" \
   --prefix=/ \
@@ -73,7 +120,9 @@ sdk_root=$(xcrun --sdk macosx --show-sdk-path)
   --enable-iconv \
   --enable-audiotoolbox \
   --enable-videotoolbox \
-  --enable-pthreads
+  --enable-pthreads \
+  --enable-libdav1d \
+  --pkg-config-flags=--static
 
 make -j"$(sysctl -n hw.logicalcpu)"
 make DESTDIR="$install_dir" install
@@ -98,10 +147,12 @@ done
 "$install_dir/bin/ffmpeg" -hide_banner -bsfs 2>&1 | grep -q 'filter_units'
 "$install_dir/bin/ffmpeg" -hide_banner -bsfs 2>&1 | grep -q 'setts'
 "$install_dir/bin/ffmpeg" -hide_banner -muxers 2>&1 | grep -q 'mp4'
+"$install_dir/bin/ffmpeg" -hide_banner -decoders 2>&1 | grep -q 'libdav1d'
 
 mkdir -p "$install_dir/licenses"
 cp "$source_dir/COPYING.LGPLv2.1" "$install_dir/licenses/FFmpeg-LGPL-2.1.txt"
 cp "$source_dir/LICENSE.md" "$install_dir/licenses/FFmpeg-LICENSE.md"
+cp "$dav1d_source_dir/COPYING" "$install_dir/licenses/dav1d-COPYING.txt"
 cp "$source_archive" "$install_dir/licenses/ffmpeg-${ffmpeg_version}.tar.xz"
 printf '%s  %s\n' "$ffmpeg_sha256" "ffmpeg-${ffmpeg_version}.tar.xz" > "$install_dir/licenses/ffmpeg-${ffmpeg_version}.tar.xz.sha256"
 

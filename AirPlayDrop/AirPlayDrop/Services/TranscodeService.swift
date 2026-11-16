@@ -1,4 +1,5 @@
 import Foundation
+import VideoToolbox
 import os
 
 private let logger = Logger(subsystem: "com.airplaydrop", category: "TranscodeService")
@@ -12,6 +13,7 @@ enum TranscodeError: LocalizedError {
     case allStrategiesFailed(String)
     case externalSubtitleUnavailable(String)
     case audioFilterUnavailable(String)
+    case av1DecoderUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -25,6 +27,8 @@ enum TranscodeError: LocalizedError {
         case .allStrategiesFailed(let details): return "No conversion strategy succeeded. \(details)"
         case .externalSubtitleUnavailable(let details): return "The selected external subtitle is unavailable: \(details)"
         case .audioFilterUnavailable(let details): return "Late Night audio is unavailable: \(details)"
+        case .av1DecoderUnavailable:
+            return "This video uses AV1, which the selected FFmpeg cannot decode on this Mac. Use the bundled FFmpeg or a build that includes libdav1d."
         }
     }
 }
@@ -94,6 +98,57 @@ enum TranscodeService {
         }.value
     }
 
+    static func decoderNames(using installation: FFmpegInstallation) async -> Set<String> {
+        await Task.detached {
+            let process = Process()
+            let output = Pipe()
+            process.executableURL = installation.ffmpeg
+            process.arguments = ["-hide_banner", "-decoders"]
+            process.standardOutput = output
+            process.standardError = FileHandle.nullDevice
+            do { try process.run() } catch { return [] }
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return [] }
+            return parseDecoderNames(String(decoding: data, as: UTF8.self))
+        }.value
+    }
+
+    /// Parses `ffmpeg -decoders` rows such as ` V....D libdav1d   dav1d AV1 decoder`.
+    static func parseDecoderNames(_ text: String) -> Set<String> {
+        var names: Set<String> = []
+        // Legend rows (` V..... = Video`) precede a ` ------` separator; only
+        // rows after it name decoders.
+        var inTable = false
+        for line in text.split(whereSeparator: \.isNewline) {
+            if !inTable {
+                inTable = line.trimmingCharacters(in: .whitespaces).allSatisfy { $0 == "-" } && line.contains("-")
+                continue
+            }
+            let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard fields.count >= 2, fields[0].count == 6,
+                  fields[0].allSatisfy({ "VASFXBD.".contains($0) }) else { continue }
+            names.insert(String(fields[1]))
+        }
+        return names
+    }
+
+    /// Input options that make the source's video decodable. FFmpeg's native
+    /// AV1 decoder only works through a hardware accelerator, which Apple
+    /// silicon provides from M3 onward. libdav1d decodes AV1 in software and
+    /// FFmpeg selects it automatically when present.
+    static func inputDecoderArguments(videoCodec: String?, hasSoftwareAV1Decoder: Bool,
+                                      hasHardwareAV1Decoder: Bool) throws -> [String] {
+        guard videoCodec?.lowercased() == "av1" else { return [] }
+        if hasSoftwareAV1Decoder { return [] }
+        if hasHardwareAV1Decoder { return ["-hwaccel", "videotoolbox"] }
+        throw TranscodeError.av1DecoderUnavailable
+    }
+
+    static var hasHardwareAV1Decoder: Bool {
+        VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
+    }
+
     static func outputURL(for input: URL) -> URL {
         input.deletingLastPathComponent()
             .appendingPathComponent(input.deletingPathExtension().lastPathComponent + "_airplay.mp4")
@@ -127,8 +182,9 @@ enum TranscodeService {
     static func ffmpegArguments(input: URL, output: URL, step: ConversionStep,
                                 selection: TrackSelection, sourceHasAudio: Bool,
                                 syncAdjustment: SyncAdjustment = .zero,
-                                mediaDuration: Double? = nil) throws -> [String] {
-        var arguments = ["-nostats", "-progress", "pipe:2", "-i", input.path]
+                                mediaDuration: Double? = nil,
+                                inputArguments: [String] = []) throws -> [String] {
+        var arguments = ["-nostats", "-progress", "pipe:2"] + inputArguments + ["-i", input.path]
         if case .external(let descriptor) = selection.subtitle,
            selection.subtitlePolicy == .includeSelected {
             guard descriptor.isCurrent else {
@@ -193,6 +249,13 @@ enum TranscodeService {
            !(await isAudioFilterAvailable(using: installation)) {
             throw TranscodeError.audioFilterUnavailable("the installed FFmpeg does not expose acompressor and alimiter")
         }
+        var inputArguments: [String] = []
+        if info.videoCodec?.lowercased() == "av1" {
+            let decoders = await decoderNames(using: installation)
+            inputArguments = try inputDecoderArguments(videoCodec: info.videoCodec,
+                hasSoftwareAV1Decoder: decoders.contains("libdav1d"),
+                hasHardwareAV1Decoder: hasHardwareAV1Decoder)
+        }
         let plan = TranscodePlanner.plan(info: info, intent: intent, selectedAudioID: selection.audioID,
                                          audioProcessingMode: audioProcessingMode,
                                          syncAdjustment: syncAdjustment,
@@ -212,7 +275,8 @@ enum TranscodeService {
             do {
                 let arguments = try ffmpegArguments(input: input, output: reservation.temporary,
                     step: step, selection: selection, sourceHasAudio: info.hasAudio,
-                    syncAdjustment: syncAdjustment, mediaDuration: info.duration)
+                    syncAdjustment: syncAdjustment, mediaDuration: info.duration,
+                    inputArguments: inputArguments)
                 try await runProcess(executable: installation.ffmpeg, arguments: arguments,
                     duration: info.duration, progress: progress)
                 try Task.checkCancellation()
