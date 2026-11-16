@@ -146,8 +146,102 @@ final class AirPlayDropTests: XCTestCase {
     }
 
     func testUnsupportedVideoUsesAppleHardwareEncoding() {
-        let strategies = TranscodePlanner.plan(info: info(video: "av1", audio: "opus"), intent: .airPlay).steps.map(\.strategy)
-        XCTAssertEqual(strategies, [.hardwareEncode])
+        let steps = TranscodePlanner.plan(info: info(video: "av1", audio: "opus"), intent: .airPlay).steps
+        XCTAssertEqual(steps.map(\.strategy), [.hardwareEncode])
+        XCTAssertTrue(steps[0].videoArguments.contains("h264_videotoolbox"))
+        XCTAssertNil(steps[0].requiredTransfer)
+    }
+
+    func testNonHEVCHDRIsEncodedAsTaggedHEVCMain10() {
+        for intent in PlaybackIntent.allCases {
+            for (codec, transfer) in [("vp9", "smpte2084"), ("av1", "arib-std-b67")] {
+                var source = info(video: codec, audio: "opus", hdr: true)
+                source = MediaInfo(formatName: source.formatName, duration: source.duration,
+                    videoCodec: codec, videoProfile: nil, pixelFormat: "yuv420p10le",
+                    colorTransfer: transfer, isDolbyVision: false, tracks: source.tracks,
+                    colorPrimaries: "bt2020", colorSpace: "bt2020nc")
+                let steps = TranscodePlanner.plan(info: source, intent: intent, selectedAudioID: 2).steps
+                XCTAssertEqual(steps.count, 1, "\(codec) \(intent): no 8-bit H.264 fallback")
+                let step = steps[0]
+                XCTAssertEqual(step.strategy, .hardwareEncode)
+                XCTAssertTrue(step.requiresHVC1)
+                XCTAssertEqual(step.requiredTransfer, transfer)
+                XCTAssertTrue(step.videoArguments.contains("hevc_videotoolbox"))
+                XCTAssertFalse(step.videoArguments.contains("h264_videotoolbox"))
+                let filter = step.videoArguments[step.videoArguments.firstIndex(of: "-vf")! + 1]
+                XCTAssertEqual(filter, "setparams=color_primaries=bt2020:color_trc=\(transfer):colorspace=bt2020nc")
+                let profile = step.videoArguments.firstIndex(of: "-profile:v")!
+                XCTAssertEqual(step.videoArguments[profile + 1], "main10")
+            }
+        }
+    }
+
+    func testHDRColorFilterDefaultsMissingPrimariesAndMatrixToBT2020() {
+        let source = MediaInfo(formatName: "matroska,webm", duration: 1, videoCodec: "vp9",
+            videoProfile: nil, pixelFormat: "yuv420p10le", colorTransfer: "smpte2084",
+            isDolbyVision: false, tracks: [], colorPrimaries: "unknown", colorSpace: nil)
+        XCTAssertEqual(HDRVideoArguments.colorFilter(for: source),
+                       "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc")
+        XCTAssertNil(HDRVideoArguments.colorFilter(for: info(video: "vp9", hdr: false)))
+    }
+
+    func testHEVCHDRAirPlayStepsRequireTransferAndTagTheEncode() {
+        let steps = TranscodePlanner.plan(info: info(hdr: true), intent: .airPlay).steps
+        XCTAssertEqual(steps.map(\.strategy), [.hdrRemux, .hardwareEncode])
+        XCTAssertEqual(steps.map(\.requiredTransfer), ["smpte2084", "smpte2084"])
+        XCTAssertTrue(steps[1].videoArguments.contains("-vf"))
+    }
+
+    func testTransferNamesMapToCoreMediaValues() {
+        XCTAssertEqual(MediaArtifactValidator.coreMediaTransferFunction(forFFmpegName: "smpte2084"),
+                       kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String)
+        XCTAssertEqual(MediaArtifactValidator.coreMediaTransferFunction(forFFmpegName: "arib-std-b67"),
+                       kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String)
+        XCTAssertNil(MediaArtifactValidator.coreMediaTransferFunction(forFFmpegName: "bt709"))
+    }
+
+    func testValidatorRejectsOutputThatLostHDRTransfer() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("sdr.mp4")
+        try await writeGeneratedSDRMovie(to: url)
+
+        let sdr = await MediaArtifactValidator.validate(url, sourceHadAudio: false)
+        XCTAssertTrue(sdr.isValid, sdr.reason ?? "")
+        let hdr = await MediaArtifactValidator.validate(url, sourceHadAudio: false, requiredTransfer: "smpte2084")
+        XCTAssertFalse(hdr.isValid)
+        XCTAssertEqual(hdr.reason, "Output lost the source's HDR transfer function.")
+    }
+
+    /// Writes a 10-frame, 64×64 H.264 movie tagged BT.709 with AVAssetWriter.
+    private func writeGeneratedSDRMovie(to url: URL) async throws {
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: 64, AVVideoHeightKey: 64,
+            AVVideoColorPropertiesKey: [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2]])
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input,
+            sourcePixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                                          kCVPixelBufferWidthKey as String: 64, kCVPixelBufferHeightKey as String: 64])
+        writer.add(input)
+        XCTAssertTrue(writer.startWriting())
+        writer.startSession(atSourceTime: .zero)
+        for frame in 0..<10 {
+            while !input.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 1_000_000) }
+            var buffer: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, adaptor.pixelBufferPool!, &buffer)
+            let pixels = try XCTUnwrap(buffer)
+            CVPixelBufferLockBaseAddress(pixels, [])
+            memset(CVPixelBufferGetBaseAddress(pixels), Int32(frame * 20), CVPixelBufferGetDataSize(pixels))
+            CVPixelBufferUnlockBaseAddress(pixels, [])
+            XCTAssertTrue(adaptor.append(pixels, withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: 10)))
+        }
+        input.markAsFinished()
+        await writer.finishWriting()
+        XCTAssertEqual(writer.status, .completed, writer.error?.localizedDescription ?? "")
     }
 
     func testExplicitAudioMappingUsesAbsoluteStreamIndex() throws {

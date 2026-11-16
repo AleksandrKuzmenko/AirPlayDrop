@@ -24,6 +24,8 @@ struct MediaArtifactManifest: Codable, Sendable {
     let audioProcessingMode: AudioProcessingMode
     let audioProcessingPresetVersion: Int
     let playbackIntent: PlaybackIntent
+    /// Absent in manifests written before transfer validation existed.
+    let requiredTransfer: String?
 }
 
 enum MediaArtifactError: LocalizedError {
@@ -55,7 +57,8 @@ enum MediaArtifactValidator {
                               syncAdjustment: SyncAdjustment = .zero,
                               audioProcessingMode: AudioProcessingMode = .standard,
                               audioProcessingPresetVersion: Int = AudioProcessingPreset.version,
-                              playbackIntent: PlaybackIntent = .local) throws {
+                              playbackIntent: PlaybackIntent = .local,
+                              requiredTransfer: String? = nil) throws {
         guard let fingerprint = sourceFingerprint(source) else { throw MediaArtifactError.missingFingerprint }
         guard let outputValues = try? artifact.resourceValues(forKeys: [.fileSizeKey]),
               let outputSize = outputValues.fileSize else { throw MediaArtifactError.missingOutputSize }
@@ -66,7 +69,7 @@ enum MediaArtifactValidator {
             selectedSubtitle: selectedSubtitle, syncAdjustment: syncAdjustment,
             audioProcessingMode: audioProcessingMode,
             audioProcessingPresetVersion: audioProcessingPresetVersion,
-            playbackIntent: playbackIntent)
+            playbackIntent: playbackIntent, requiredTransfer: requiredTransfer)
         let data = try JSONEncoder().encode(manifest)
         try data.write(to: manifestURL(for: artifact), options: .atomic)
     }
@@ -96,11 +99,13 @@ enum MediaArtifactValidator {
             return MediaArtifactValidation(isValid: false, hasVideo: false, hasAudio: false, duration: nil, reason: "No current artifact manifest")
         }
         return await validate(artifact, sourceHadAudio: manifest.sourceHadAudio,
-            expectedDuration: manifest.expectedDuration, requiresHVC1: manifest.requiresHVC1)
+            expectedDuration: manifest.expectedDuration, requiresHVC1: manifest.requiresHVC1,
+            requiredTransfer: manifest.requiredTransfer)
     }
 
     static func validate(_ url: URL, sourceHadAudio: Bool = true,
-                         expectedDuration: Double? = nil, requiresHVC1: Bool = false) async -> MediaArtifactValidation {
+                         expectedDuration: Double? = nil, requiresHVC1: Bool = false,
+                         requiredTransfer: String? = nil) async -> MediaArtifactValidation {
         guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
               (values.fileSize ?? 0) > 0 else {
             return MediaArtifactValidation(isValid: false, hasVideo: false, hasAudio: false, duration: nil, reason: "Output is empty or missing")
@@ -129,22 +134,45 @@ enum MediaArtifactValidator {
             } else {
                 hasRequiredCodec = !requiresHVC1
             }
-            let valid = playable && hasVideo && (!sourceHadAudio || hasAudio) && durationMatches && hasRequiredCodec
+            let transferMatches: Bool
+            if let requiredTransfer {
+                let expected = coreMediaTransferFunction(forFFmpegName: requiredTransfer)
+                let descriptions = (try? await video.first?.load(.formatDescriptions)) ?? []
+                transferMatches = expected != nil && descriptions.contains {
+                    (CMFormatDescriptionGetExtension($0,
+                        extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String) == expected
+                }
+            } else {
+                transferMatches = true
+            }
+            let valid = playable && hasVideo && (!sourceHadAudio || hasAudio) && durationMatches
+                && hasRequiredCodec && transferMatches
             return MediaArtifactValidation(isValid: valid, hasVideo: hasVideo, hasAudio: hasAudio,
                 duration: seconds, reason: valid ? nil : validationReason(playable: playable, hasVideo: hasVideo,
                     sourceHadAudio: sourceHadAudio, hasAudio: hasAudio, durationMatches: durationMatches,
-                    codecMatches: hasRequiredCodec))
+                    codecMatches: hasRequiredCodec, transferMatches: transferMatches))
         } catch {
             return MediaArtifactValidation(isValid: false, hasVideo: false, hasAudio: false, duration: nil, reason: error.localizedDescription)
         }
     }
 
+    /// Maps FFmpeg `color_trc` names to Core Media transfer-function values.
+    static func coreMediaTransferFunction(forFFmpegName name: String) -> String? {
+        switch name {
+        case "smpte2084": return kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String
+        case "arib-std-b67": return kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String
+        default: return nil
+        }
+    }
+
     private static func validationReason(playable: Bool, hasVideo: Bool, sourceHadAudio: Bool,
-                                         hasAudio: Bool, durationMatches: Bool, codecMatches: Bool) -> String {
+                                         hasAudio: Bool, durationMatches: Bool, codecMatches: Bool,
+                                         transferMatches: Bool = true) -> String {
         if !playable || !hasVideo { return "Output is not a playable video." }
         if sourceHadAudio && !hasAudio { return "The selected source audio track is missing from the output." }
         if !durationMatches { return "Output duration differs from the source." }
         if !codecMatches { return "Output does not use the required hvc1 HEVC sample entry." }
+        if !transferMatches { return "Output lost the source's HDR transfer function." }
         return "Output validation failed."
     }
 }

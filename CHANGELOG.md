@@ -9,6 +9,7 @@
 - Fixed media probing failing on files whose FFprobe side data contains numbers (rotated phone videos, HDR10 light-level metadata, Dolby Vision configuration records); the Dolby Vision profile and rotation are now recorded.
 - HDR and Dolby Vision files that AVFoundation cannot open (such as MKV) are now re-prepared for Apple TV before AirPlay playback instead of streaming a local-only copy.
 - Fixed AV1 videos failing every preparation strategy: the bundled FFmpeg now includes the pinned dav1d 1.5.4 software decoder. With an external FFmpeg that lacks dav1d, AirPlayDrop uses VideoToolbox hardware decoding on Macs that support it and otherwise reports a clear error.
+- HDR10 and HLG sources that cannot be stream-copied, such as AV1 and VP9, are now encoded as 10-bit HEVC with explicit BT.2020 and PQ/HLG tags instead of 8-bit H.264. Prepared HDR copies are rejected if they lose their HDR transfer function. The bundled FFmpeg adds the `setparams` filter for this.
 - The FFmpeg build script now starts from an empty build directory so it keeps working after Xcode SDK updates.
 
 ## 0.1.0-alpha — 2026-09-22

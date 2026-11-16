@@ -67,6 +67,15 @@ struct MediaInfo: Codable, Equatable, Sendable {
     var dolbyVisionCompatibilityID: Int? = nil
     /// Display-matrix rotation in degrees, when present.
     var rotation: Double? = nil
+    /// FFmpeg colour primaries name, such as `bt2020`.
+    var colorPrimaries: String? = nil
+    /// FFmpeg colour matrix name, such as `bt2020nc`.
+    var colorSpace: String? = nil
+
+    /// The PQ or HLG transfer function when the video signals HDR10 or HLG.
+    var hdrTransfer: String? {
+        ["smpte2084", "arib-std-b67"].contains(colorTransfer) ? colorTransfer : nil
+    }
 
     var audioTracks: [MediaTrack] { tracks.filter { $0.kind == .audio } }
     var subtitleTracks: [MediaTrack] { tracks.filter { $0.kind == .subtitle } }
@@ -236,15 +245,46 @@ struct ConversionStep: Equatable, Sendable {
     let audioArguments: [String]
     let requiresHVC1: Bool
     let audioProcessingMode: AudioProcessingMode
+    /// FFmpeg transfer name (`smpte2084` or `arib-std-b67`) the output must
+    /// still signal, so an HDR source never silently becomes an SDR-tagged file.
+    let requiredTransfer: String?
 
     init(strategy: ConversionStrategy, reason: String, videoArguments: [String], audioArguments: [String],
-         requiresHVC1: Bool, audioProcessingMode: AudioProcessingMode = .standard) {
+         requiresHVC1: Bool, audioProcessingMode: AudioProcessingMode = .standard,
+         requiredTransfer: String? = nil) {
         self.strategy = strategy
         self.reason = reason
         self.videoArguments = videoArguments
         self.audioArguments = audioArguments
         self.requiresHVC1 = requiresHVC1
         self.audioProcessingMode = audioProcessingMode
+        self.requiredTransfer = requiredTransfer
+    }
+}
+
+enum HDRVideoArguments {
+    /// HEVC Main 10 VideoToolbox encode that keeps HDR10/HLG signalling.
+    /// Apple TV only switches to HDR when the output carries colour tags.
+    /// FFmpeg encoders take colour properties from decoded frames and ignore
+    /// `-color_trc`-style output options, so the tags are set on the frames
+    /// with `setparams`. Missing source primaries or matrix default to
+    /// BT.2020, which HDR10 and HLG both specify.
+    static func hevcMain10(for info: MediaInfo) -> [String] {
+        let filter = colorFilter(for: info).map { ["-vf", $0] } ?? []
+        return filter + ["-c:v", "hevc_videotoolbox", "-profile:v", "main10", "-pix_fmt", "p010le",
+                         "-b:v", "12000k", "-tag:v", "hvc1"]
+    }
+
+    static func colorFilter(for info: MediaInfo) -> String? {
+        guard let transfer = info.hdrTransfer else { return nil }
+        return "setparams=color_primaries=\(known(info.colorPrimaries) ?? "bt2020")"
+            + ":color_trc=\(transfer)"
+            + ":colorspace=\(known(info.colorSpace) ?? "bt2020nc")"
+    }
+
+    private static func known(_ value: String?) -> String? {
+        guard let value, !["unknown", "unspecified", "reserved"].contains(value) else { return nil }
+        return value
     }
 }
 
@@ -276,13 +316,26 @@ enum TranscodePlanner {
                     reason: "Preserve the HEVC HDR base layer, remove Dolby Vision RPU data, and create an hvc1 MP4.",
                     videoArguments: ["-c:v", "copy", "-bsf:v", "filter_units=remove_types=62", "-tag:v", "hvc1"],
                     audioArguments: ["-c:a", "aac", "-ac:a", "2", "-b:a", "192k"], requiresHVC1: true,
-                    audioProcessingMode: audioProcessingMode),
+                    audioProcessingMode: audioProcessingMode, requiredTransfer: info.hdrTransfer),
                 ConversionStep(strategy: .hardwareEncode,
                     reason: "Re-encode HDR as HEVC Main 10 when the lossless HDR remux is rejected.",
-                    videoArguments: ["-c:v", "hevc_videotoolbox", "-profile:v", "main10", "-pix_fmt", "p010le", "-b:v", "12000k", "-tag:v", "hvc1"],
+                    videoArguments: HDRVideoArguments.hevcMain10(for: info),
                     audioArguments: ["-c:a", "aac", "-ac:a", "2", "-b:a", "192k"], requiresHVC1: true,
-                    audioProcessingMode: audioProcessingMode)
+                    audioProcessingMode: audioProcessingMode, requiredTransfer: info.hdrTransfer)
             ], reason: info.isDolbyVision ? "Dolby Vision needs an Apple TV compatible HDR10 fallback." : "HDR HEVC needs an AirPlay-safe MP4 sample entry.")
+        }
+
+        // AV1, VP9, and other HDR sources that cannot be stream-copied. The
+        // generic H.264 encode would produce 8-bit video still tagged PQ/HLG,
+        // so HDR is encoded as HEVC Main 10 instead, with no H.264 fallback.
+        if let transfer = info.hdrTransfer, !["h264", "hevc"].contains(video) {
+            return ConversionPlan(intent: intent, steps: [
+                ConversionStep(strategy: .hardwareEncode,
+                    reason: "Encode HDR video as HEVC Main 10, keeping its HDR signalling.",
+                    videoArguments: HDRVideoArguments.hevcMain10(for: info),
+                    audioArguments: ["-c:a", "aac", "-ac:a", "2", "-b:a", "192k"], requiresHVC1: true,
+                    audioProcessingMode: audioProcessingMode, requiredTransfer: transfer)
+            ], reason: "HDR \((video ?? "video").uppercased()) needs a 10-bit HEVC copy to keep HDR on Apple TV.")
         }
 
         var steps: [ConversionStep] = []
