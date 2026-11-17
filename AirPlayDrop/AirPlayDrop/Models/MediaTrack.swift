@@ -337,7 +337,7 @@ enum HDRVideoArguments {
         let filters = limits.filters + [colorFilter(for: info)].compactMap { $0 }
         return (filters.isEmpty ? [] : ["-vf", filters.joined(separator: ",")]) + limits.output
             + ["-c:v", "hevc_videotoolbox", "-profile:v", "main10", "-pix_fmt", "p010le",
-               "-b:v", "\(HDRBitRate.kilobits(for: info, intent: intent))k", "-tag:v", "hvc1"]
+               "-b:v", "\(VideoBitRate.kilobits(for: info, intent: intent, target: .hevcHDR))k", "-tag:v", "hvc1"]
     }
 
     static func colorFilter(for info: MediaInfo) -> String? {
@@ -353,40 +353,60 @@ enum HDRVideoArguments {
     }
 }
 
-/// Target bit rate for HEVC Main 10 HDR encodes.
+/// Target bit rates for VideoToolbox encodes.
 ///
-/// The base rates are the highest HDR (HEVC) rung for each resolution in
-/// item 1.25 of Apple's HLS authoring specification, given for 30 fps. A
-/// single AirPlay stream on a home network has no adaptive ladder to fall
-/// back on, so it uses the top rung. Rates between rungs are interpolated
-/// by pixel count; larger or smaller frames scale with pixel count.
+/// The base rates are the highest rung for each resolution in item 1.25 of
+/// Apple's HLS authoring specification: the HDR (HEVC) column for HDR
+/// encodes and the H.264/AVC column for H.264 encodes. A single AirPlay
+/// stream on a home network has no adaptive ladder to fall back on, so it
+/// uses the top rung. Rates between rungs are interpolated by pixel count,
+/// and larger or smaller frames scale with pixel count. Apple's H.264 column
+/// stops at 1080p, so 2160p H.264 is extrapolated to four times the 1080p rate.
 ///
-/// Apple says 24 fps HEVC should use about 20% less. It gives no figure for
-/// higher frame rates; AirPlayDrop adds half the 30 fps rate at 60 fps.
-/// A re-encode cannot add detail, so the target never exceeds the source's
-/// own bit rate by more than 25% when that is known.
-enum HDRBitRate {
-    /// (pixels, kbit/s at 30 fps)
-    static let ladder: [(pixels: Int, kilobits: Int)] = [
+/// Apple gives the HEVC rates for 30 fps and says 24 fps HEVC should use
+/// about 20% less; it gives no figure for higher frame rates, so AirPlayDrop
+/// adds half the 30 fps rate at 60 fps for both codecs.
+///
+/// A re-encode cannot add detail, so the target never exceeds 125% of the
+/// source's own bit rate when that is known. H.264 needs roughly twice the
+/// rate of HEVC, VP9, or AV1 for similar quality, so encoding one of those
+/// to H.264 allows up to 200%.
+enum VideoBitRate {
+    enum Target: Sendable { case h264, hevcHDR }
+
+    /// (pixels, kbit/s)
+    static let hdrLadder: [(pixels: Int, kilobits: Int)] = [
         (960 * 540, 1_930),
         (1280 * 720, 4_080),
         (1920 * 1080, 7_000),
         (2560 * 1440, 9_700),
         (3840 * 2160, 20_000),
     ]
+    static let h264Ladder: [(pixels: Int, kilobits: Int)] = [
+        (960 * 540, 2_000),
+        (1280 * 720, 4_500),
+        (1920 * 1080, 7_800),
+    ]
     static let minimumKilobits = 500
-    static let sourceHeadroom = 1.25
+    static let efficientSourceCodecs: Set<String> = ["hevc", "vp9", "av1"]
 
-    static func kilobits(for info: MediaInfo, intent: PlaybackIntent) -> Int {
+    static func kilobits(for info: MediaInfo, intent: PlaybackIntent, target: Target) -> Int {
         let pixels = outputPixels(for: info, intent: intent)
-        var rate = Double(baseKilobits(forPixels: pixels)) * frameRateFactor(outputFrameRate(for: info, intent: intent))
+        let ladder = target == .h264 ? h264Ladder : hdrLadder
+        var rate = Double(baseKilobits(forPixels: pixels, ladder: ladder))
+            * frameRateFactor(outputFrameRate(for: info, intent: intent), target: target)
         if let source = info.estimatedVideoBitRate, source > 0 {
-            rate = min(rate, Double(source) / 1000 * sourceHeadroom)
+            rate = min(rate, Double(source) / 1000 * sourceHeadroom(for: info, target: target))
         }
         return max(minimumKilobits, Int(rate.rounded()))
     }
 
-    static func baseKilobits(forPixels pixels: Int) -> Int {
+    static func sourceHeadroom(for info: MediaInfo, target: Target) -> Double {
+        let codec = info.videoCodec?.lowercased() ?? ""
+        return target == .h264 && efficientSourceCodecs.contains(codec) ? 2 : 1.25
+    }
+
+    static func baseKilobits(forPixels pixels: Int, ladder: [(pixels: Int, kilobits: Int)]) -> Int {
         guard let first = ladder.first, let last = ladder.last else { return 0 }
         if pixels <= first.pixels {
             return Int((Double(first.kilobits) * Double(pixels) / Double(first.pixels)).rounded())
@@ -401,9 +421,10 @@ enum HDRBitRate {
         return last.kilobits
     }
 
-    static func frameRateFactor(_ rate: Double?) -> Double {
+    static func frameRateFactor(_ rate: Double?, target: Target) -> Double {
         guard let rate, rate > 0 else { return 1 }
-        if rate < 24.5 { return 0.8 }
+        // Apple's 24 fps reduction is stated for HEVC only.
+        if rate < 24.5 { return target == .hevcHDR ? 0.8 : 1 }
         if rate <= 31 { return 1 }
         return 1 + 0.5 * (rate - 30) / 30
     }
@@ -559,7 +580,8 @@ enum TranscodePlanner {
                                             : (filters: [], output: [])
         let h264Filters = conforming.filters + ["format=yuv420p"]
         let h264Encode = ["-vf", h264Filters.joined(separator: ",")] + conforming.output
-            + ["-c:v", "h264_videotoolbox", "-b:v", "5000k"]
+            + ["-c:v", "h264_videotoolbox",
+               "-b:v", "\(VideoBitRate.kilobits(for: info, intent: intent, target: .h264))k"]
         let audioTrack = info.audioTracks.first(where: { $0.id == selectedAudioID }) ?? info.audioTracks.first
         let audio = audioTrack?.codec.lowercased()
         let preferredAudio = AudioArguments.preferred(audioTrack, mode: audioProcessingMode,

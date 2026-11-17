@@ -323,7 +323,7 @@ final class AirPlayDropTests: XCTestCase {
             }
         }
         let tenBit = TranscodePlanner.plan(info: sources[0], intent: .airPlay, selectedAudioID: 2).steps[0]
-        XCTAssertEqual(tenBit.videoArguments, ["-vf", "format=yuv420p", "-c:v", "h264_videotoolbox", "-b:v", "5000k"])
+        XCTAssertEqual(tenBit.videoArguments, ["-vf", "format=yuv420p", "-c:v", "h264_videotoolbox", "-b:v", "7800k"])
         XCTAssertEqual(tenBit.audioArguments, ["-c:a", "copy"])
         let fast = TranscodePlanner.plan(info: sources[1], intent: .airPlay, selectedAudioID: 2).steps[0]
         XCTAssertEqual(Array(fast.videoArguments.prefix(4)), ["-vf", "format=yuv420p", "-r", "120/2"])
@@ -381,7 +381,7 @@ final class AirPlayDropTests: XCTestCase {
         var info = video("vp9", profile: nil, pixelFormat: "yuv420p10le", width: width, height: height,
                          frameRate: frameRate, hdr: true)
         info.videoBitRate = source
-        return HDRBitRate.kilobits(for: info, intent: intent)
+        return VideoBitRate.kilobits(for: info, intent: intent, target: .hevcHDR)
     }
 
     func testHDRBitRateFollowsAppleLadderForResolution() {
@@ -410,6 +410,39 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertEqual(hdrBitRate(width: 1920, height: 1080, frameRate: "30/1", source: 40_000_000), 7_000)
     }
 
+    private func h264BitRate(_ codec: String = "mpeg2video", width: Int?, height: Int?, frameRate: String?,
+                             source: Int? = nil) -> Int {
+        var info = video(codec, profile: nil, pixelFormat: "yuv420p", width: width, height: height,
+                         frameRate: frameRate)
+        info.videoBitRate = source
+        return VideoBitRate.kilobits(for: info, intent: .airPlay, target: .h264)
+    }
+
+    func testH264BitRateFollowsAppleLadder() {
+        XCTAssertEqual(h264BitRate(width: 1920, height: 1080, frameRate: "30/1"), 7_800)
+        XCTAssertEqual(h264BitRate(width: 1280, height: 720, frameRate: "25/1"), 4_500)
+        XCTAssertEqual(h264BitRate(width: 960, height: 540, frameRate: "30/1"), 2_000)
+        XCTAssertEqual(h264BitRate(width: 320, height: 180, frameRate: "30/1"), 500)
+        // Apple's H.264 column stops at 1080p; 2160p scales by pixel count.
+        XCTAssertEqual(h264BitRate(width: 3840, height: 2160, frameRate: "30/1"), 31_200)
+        // The 24 fps reduction applies to HEVC only; 60 fps adds half.
+        XCTAssertEqual(h264BitRate(width: 1920, height: 1080, frameRate: "24000/1001"), 7_800)
+        XCTAssertEqual(h264BitRate(width: 1920, height: 1080, frameRate: "60/1"), 11_700)
+    }
+
+    func testH264BitRateCapDependsOnSourceCodecEfficiency() {
+        // Re-encoding H.264 or older codecs allows 125% of the source rate.
+        XCTAssertEqual(h264BitRate("h264", width: 1920, height: 1080, frameRate: "30/1", source: 4_000_000), 5_000)
+        XCTAssertEqual(h264BitRate("mpeg2video", width: 1920, height: 1080, frameRate: "30/1", source: 4_000_000), 5_000)
+        // HEVC, VP9, and AV1 need about twice the rate as H.264.
+        XCTAssertEqual(h264BitRate("vp9", width: 1920, height: 1080, frameRate: "30/1", source: 3_000_000), 6_000)
+        XCTAssertEqual(h264BitRate("av1", width: 1920, height: 1080, frameRate: "30/1", source: 5_000_000), 7_800)
+        let plan = TranscodePlanner.plan(info: video("vp9", profile: nil, pixelFormat: "yuv420p",
+            width: 1280, height: 720, frameRate: "30/1"), intent: .airPlay, selectedAudioID: 2)
+        let step = plan.steps.last!
+        XCTAssertEqual(step.videoArguments.suffix(4), ["-c:v", "h264_videotoolbox", "-b:v", "4500k"])
+    }
+
     func testHDRBitRateUsesProbedSourceRates() throws {
         // Verbatim FFprobe 9.0.2 fields from a generated 4:2:2 HLG libx265 clip.
         let data = #"{"streams":[{"index":0,"codec_name":"hevc","profile":"Rext","codec_type":"video","width":1920,"height":1080,"pix_fmt":"yuv422p10le","color_transfer":"arib-std-b67","color_primaries":"bt2020","avg_frame_rate":"50/1","bit_rate":"6342024"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"1.000000","bit_rate":"6455536"}}"#.data(using: .utf8)!
@@ -417,7 +450,7 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertEqual(mapped.videoBitRate, 6_342_024)
         XCTAssertEqual(mapped.containerBitRate, 6_455_536)
         // 50 fps raises 7,000 to 9,333; the 6.34 Mbit/s source caps it at 7,928.
-        XCTAssertEqual(HDRBitRate.kilobits(for: mapped, intent: .airPlay), 7_928)
+        XCTAssertEqual(VideoBitRate.kilobits(for: mapped, intent: .airPlay, target: .hevcHDR), 7_928)
         let step = TranscodePlanner.plan(info: mapped, intent: .airPlay).steps[0]
         let rate = try XCTUnwrap(step.videoArguments.firstIndex(of: "-b:v"))
         XCTAssertEqual(step.videoArguments[rate + 1], "7928k")
