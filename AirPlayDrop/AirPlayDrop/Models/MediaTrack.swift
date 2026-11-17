@@ -65,6 +65,8 @@ struct MediaInfo: Codable, Equatable, Sendable {
     var dolbyVisionProfile: Int? = nil
     /// Base-layer signal compatibility ID; 0 means no HDR10/SDR-compatible base layer.
     var dolbyVisionCompatibilityID: Int? = nil
+    /// The configuration record's `el_present_flag`, set for dual-layer profile 7.
+    var dolbyVisionHasEnhancementLayer: Bool? = nil
     /// Display-matrix rotation in degrees, when present.
     var rotation: Double? = nil
     /// FFmpeg colour primaries name, such as `bt2020`.
@@ -89,6 +91,12 @@ struct MediaInfo: Codable, Equatable, Sendable {
         guard let (numerator, denominator) = AppleTVVideoCompatibility.rational(averageFrameRate),
               numerator > 0 else { return nil }
         return Double(numerator) / Double(denominator)
+    }
+
+    /// Profile 7 (UHD Blu-ray) carries an enhancement layer next to its HDR10
+    /// base layer. Apple TV supports only single-layer profiles 5 and 8.
+    var isDualLayerDolbyVision: Bool {
+        isDolbyVision && (dolbyVisionHasEnhancementLayer == true || dolbyVisionProfile == 7)
     }
 
     /// The PQ or HLG transfer function when the video signals HDR10 or HLG.
@@ -466,8 +474,10 @@ enum VideoBitRate {
 /// re-encode. Unknown fields and unrecognised profile names count as compatible
 /// for the same reason; the pixel format still catches bit depth and chroma.
 enum AppleTVVideoCompatibility {
-    /// Bump when the rules change so AirPlay copies prepared under older rules are re-prepared.
-    static let rulesVersion = 1
+    /// Bump when the rules or the AirPlay video preparation change, so AirPlay
+    /// copies prepared earlier are re-prepared. Version 2 strips the Dolby
+    /// Vision profile 7 enhancement layer that version 1 copies kept.
+    static let rulesVersion = 2
     static let maxLongSide = 4096
     static let maxShortSide = 2160
     static let maxFrameRate = 60.0
@@ -610,13 +620,21 @@ enum TranscodePlanner {
 
         if intent == .airPlay, video == "hevc", info.isHDR {
             let remux = !canCopyVideo ? [] : [
+                // Dolby Vision RPUs are NAL type 62. A single-track dual-layer
+                // profile 7 stream also wraps every enhancement-layer NAL,
+                // including its own parameter sets, in NAL type 63. Both are
+                // unspecified types in plain HEVC, so removing them leaves the
+                // HDR10 base layer and changes nothing for other HDR sources.
                 ConversionStep(strategy: .hdrRemux,
-                    reason: "Preserve the HEVC HDR base layer, remove Dolby Vision RPU data, and create an hvc1 MP4.",
-                    videoArguments: ["-c:v", "copy", "-bsf:v", "filter_units=remove_types=62", "-tag:v", "hvc1"],
+                    reason: info.isDualLayerDolbyVision
+                        ? "Keep the HDR10 base layer, remove the Dolby Vision enhancement layer and RPU data, and create an hvc1 MP4."
+                        : "Preserve the HEVC HDR base layer, remove Dolby Vision RPU data, and create an hvc1 MP4.",
+                    videoArguments: ["-c:v", "copy", "-bsf:v", "filter_units=remove_types=62|63", "-tag:v", "hvc1"],
                     audioArguments: preferredAudio, requiresHVC1: true,
                     audioProcessingMode: audioProcessingMode, requiredTransfer: info.hdrTransfer)
             ]
             let reason = !appleTVIssues.isEmpty ? AppleTVVideoCompatibility.reason(for: appleTVIssues)
+                : info.isDualLayerDolbyVision ? "Dual-layer Dolby Vision (profile 7) plays on Apple TV only as its HDR10 base layer."
                 : info.isDolbyVision ? "Dolby Vision needs an Apple TV compatible HDR10 fallback."
                 : "HDR HEVC needs an AirPlay-safe MP4 sample entry."
             return ConversionPlan(intent: intent, steps: remux + encodeSteps(strategy: .hardwareEncode,

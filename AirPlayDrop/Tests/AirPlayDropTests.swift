@@ -686,6 +686,44 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertEqual(mapped.dolbyVisionCompatibilityID, 0)
     }
 
+    func testProbeParsesDualLayerDolbyVisionProfile7() throws {
+        // Field names and types match ffprobe.c output for AV_PKT_DATA_DOVI_CONF;
+        // values are those of a UHD Blu-ray profile 7 stream (BL + EL + RPU).
+        let data = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","profile":"Main 10","pix_fmt":"yuv420p10le","color_transfer":"smpte2084","side_data_list":[{"side_data_type":"DOVI configuration record","dv_version_major":1,"dv_version_minor":0,"dv_profile":7,"dv_level":6,"rpu_present_flag":1,"el_present_flag":1,"bl_present_flag":1,"dv_bl_signal_compatibility_id":6,"dv_md_compression":"none"}],"disposition":{"default":1}}],"format":{"format_name":"matroska,webm","duration":"10.0"}}"#.data(using: .utf8)!
+        let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))
+        XCTAssertEqual(mapped.dolbyVisionProfile, 7)
+        XCTAssertEqual(mapped.dolbyVisionCompatibilityID, 6)
+        XCTAssertEqual(mapped.dolbyVisionHasEnhancementLayer, true)
+        XCTAssertTrue(mapped.isDualLayerDolbyVision)
+    }
+
+    func testDualLayerDolbyVisionRemuxStripsEnhancementLayerAndRPU() {
+        var profile7 = info(hdr: true, dolbyVision: true)
+        profile7.dolbyVisionProfile = 7
+        profile7.dolbyVisionHasEnhancementLayer = true
+        let plan = TranscodePlanner.plan(info: profile7, intent: .airPlay, selectedAudioID: 2)
+        XCTAssertEqual(plan.reason, "Dual-layer Dolby Vision (profile 7) plays on Apple TV only as its HDR10 base layer.")
+        let remux = plan.steps[0]
+        XCTAssertEqual(remux.strategy, .hdrRemux)
+        XCTAssertEqual(remux.videoArguments, ["-c:v", "copy", "-bsf:v", "filter_units=remove_types=62|63", "-tag:v", "hvc1"])
+        XCTAssertTrue(remux.reason.contains("enhancement layer"))
+        XCTAssertEqual(remux.requiredTransfer, "smpte2084")
+
+        // A profile 7 record without el_present_flag is still dual-layer.
+        var profileOnly = info(hdr: true, dolbyVision: true)
+        profileOnly.dolbyVisionProfile = 7
+        XCTAssertTrue(profileOnly.isDualLayerDolbyVision)
+
+        var profile8 = info(hdr: true, dolbyVision: true)
+        profile8.dolbyVisionProfile = 8
+        profile8.dolbyVisionHasEnhancementLayer = false
+        XCTAssertFalse(profile8.isDualLayerDolbyVision)
+        let single = TranscodePlanner.plan(info: profile8, intent: .airPlay, selectedAudioID: 2)
+        XCTAssertEqual(single.reason, "Dolby Vision needs an Apple TV compatible HDR10 fallback.")
+        XCTAssertEqual(single.steps[0].videoArguments, remux.videoArguments)
+        XCTAssertFalse(info(hdr: true).isDualLayerDolbyVision)
+    }
+
     func testProbeToleratesUnexpectedSideDataFieldTypes() throws {
         let data = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","side_data_list":[{"side_data_type":7,"rotation":"ninety","dv_profile":"eight"}]}],"format":{"format_name":"mp4","duration":"1.0"}}"#.data(using: .utf8)!
         let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))

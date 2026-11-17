@@ -104,18 +104,20 @@ struct FFprobeSideData: Codable, Equatable, Sendable {
     let side_data_type: String?
     let dv_profile: Int?
     let dv_bl_signal_compatibility_id: Int?
+    let el_present_flag: Int?
     let rotation: Double?
 
     init(side_data_type: String?, dv_profile: Int? = nil,
-         dv_bl_signal_compatibility_id: Int? = nil, rotation: Double? = nil) {
+         dv_bl_signal_compatibility_id: Int? = nil, el_present_flag: Int? = nil, rotation: Double? = nil) {
         self.side_data_type = side_data_type
         self.dv_profile = dv_profile
         self.dv_bl_signal_compatibility_id = dv_bl_signal_compatibility_id
+        self.el_present_flag = el_present_flag
         self.rotation = rotation
     }
 
     private enum CodingKeys: String, CodingKey {
-        case side_data_type, dv_profile, dv_bl_signal_compatibility_id, rotation
+        case side_data_type, dv_profile, dv_bl_signal_compatibility_id, el_present_flag, rotation
     }
 
     init(from decoder: Decoder) throws {
@@ -123,6 +125,7 @@ struct FFprobeSideData: Codable, Equatable, Sendable {
         side_data_type = try? values.decodeIfPresent(String.self, forKey: .side_data_type)
         dv_profile = try? values.decodeIfPresent(Int.self, forKey: .dv_profile)
         dv_bl_signal_compatibility_id = try? values.decodeIfPresent(Int.self, forKey: .dv_bl_signal_compatibility_id)
+        el_present_flag = try? values.decodeIfPresent(Int.self, forKey: .el_present_flag)
         rotation = try? values.decodeIfPresent(Double.self, forKey: .rotation)
     }
 
@@ -245,6 +248,7 @@ enum FFprobeService {
             isDolbyVision: dolbyVision != nil, tracks: tracks,
             dolbyVisionProfile: dolbyVision?.dv_profile,
             dolbyVisionCompatibilityID: dolbyVision?.dv_bl_signal_compatibility_id,
+            dolbyVisionHasEnhancementLayer: dolbyVision?.el_present_flag.map { $0 == 1 },
             rotation: sideData.compactMap(\.rotation).first,
             colorPrimaries: video?.color_primaries,
             colorSpace: video?.color_space,
