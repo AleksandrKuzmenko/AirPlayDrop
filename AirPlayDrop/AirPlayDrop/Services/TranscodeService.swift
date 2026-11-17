@@ -256,11 +256,17 @@ enum TranscodeService {
             videoOnly.subtitlePolicy = .omit
             var mapping = try streamArguments(selection: videoOnly, sourceHasAudio: sourceHasAudio)
             if let video = mapping.firstIndex(of: "0:v:0") { mapping[video] = VideoFilterGraph.outputLabel }
-            return arguments + mapping + step.videoArguments
-                + (selection.audioID != nil ? step.audioArguments : [])
-                + (selection.audioID != nil ? audioFilter(for: syncAdjustment, mode: step.audioProcessingMode,
-                                                          mediaDuration: mediaDuration).map { ["-af", $0] } ?? [] : [])
-                + ["-movflags", "+faststart", output.path]
+            arguments += mapping
+            arguments += step.videoArguments
+            if selection.audioID != nil {
+                arguments += step.audioArguments
+                if let filter = audioFilter(for: syncAdjustment, mode: step.audioProcessingMode,
+                                            mediaDuration: mediaDuration) {
+                    arguments += ["-af", filter]
+                }
+            }
+            arguments += ["-movflags", "+faststart", output.path]
+            return arguments
         }
         arguments += try streamArguments(selection: selection, sourceHasAudio: sourceHasAudio,
                                          hasExternalSubtitleInput: selection.subtitle.externalDescriptor != nil)
