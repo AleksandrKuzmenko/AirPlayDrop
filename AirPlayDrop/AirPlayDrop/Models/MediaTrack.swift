@@ -43,6 +43,12 @@ struct MediaTrack: Identifiable, Codable, Equatable, Sendable {
                   isForced: try values.decodeIfPresent(Bool.self, forKey: .isForced) ?? false)
     }
 
+    /// Bitmap subtitle formats (Blu-ray PGS, DVD VobSub, DVB, XSUB). MP4 cannot
+    /// carry them, so they are burned into the video instead.
+    static let bitmapSubtitleCodecs: Set<String> = ["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"]
+
+    var isBitmapSubtitle: Bool { kind == .subtitle && Self.bitmapSubtitleCodecs.contains(codec) }
+
     var displayName: String {
         let label = title ?? language?.uppercased() ?? "Track \(id)"
         let details = [codec.uppercased(), channels.map { "\($0) ch" }]
@@ -297,10 +303,14 @@ struct ConversionStep: Equatable, Sendable {
     let requiredTransfer: String?
     /// The output must keep a `dvh1` sample entry and Dolby Vision configuration box.
     let requiresDolbyVision: Bool
+    /// The video arguments draw the selected subtitle into the picture through
+    /// a filter graph, so the stream mapping uses its output instead of the
+    /// source video and does not carry the subtitle stream.
+    let burnsInSubtitle: Bool
 
     init(strategy: ConversionStrategy, reason: String, videoArguments: [String], audioArguments: [String],
          requiresHVC1: Bool, audioProcessingMode: AudioProcessingMode = .standard,
-         requiredTransfer: String? = nil, requiresDolbyVision: Bool = false) {
+         requiredTransfer: String? = nil, requiresDolbyVision: Bool = false, burnsInSubtitle: Bool = false) {
         self.strategy = strategy
         self.reason = reason
         self.videoArguments = videoArguments
@@ -309,6 +319,7 @@ struct ConversionStep: Equatable, Sendable {
         self.audioProcessingMode = audioProcessingMode
         self.requiredTransfer = requiredTransfer
         self.requiresDolbyVision = requiresDolbyVision
+        self.burnsInSubtitle = burnsInSubtitle
     }
 }
 
@@ -361,12 +372,14 @@ enum HDRVideoArguments {
     /// with `setparams`. Missing source primaries or matrix default to
     /// BT.2020, which HDR10 and HLG both specify.
     static func hevcMain10(for info: MediaInfo, intent: PlaybackIntent = .local,
-                           deinterlaceFilter: String? = Deinterlace.filter) -> [String] {
+                           deinterlaceFilter: String? = Deinterlace.filter,
+                           burnIn: SubtitleBurnIn? = nil) -> [String] {
         let limits = intent == .airPlay ? AppleTVVideoCompatibility.conformingArguments(for: info)
                                         : (filters: [], output: [])
-        let filters = Deinterlace.filters(for: info, filter: deinterlaceFilter) + limits.filters
-            + [colorFilter(for: info)].compactMap { $0 }
-        return (filters.isEmpty ? [] : ["-vf", filters.joined(separator: ",")]) + limits.output
+        return VideoFilterGraph.arguments(pre: Deinterlace.filters(for: info, filter: deinterlaceFilter),
+                                          post: limits.filters + [colorFilter(for: info)].compactMap { $0 },
+                                          burnIn: burnIn, info: info)
+            + limits.output
             + ["-c:v", "hevc_videotoolbox", "-profile:v", "main10", "-pix_fmt", "p010le",
                "-b:v", "\(VideoBitRate.kilobits(for: info, intent: intent, target: .hevcHDR))k", "-tag:v", "hvc1"]
     }
@@ -381,6 +394,73 @@ enum HDRVideoArguments {
     private static func known(_ value: String?) -> String? {
         guard let value, !["unknown", "unspecified", "reserved"].contains(value) else { return nil }
         return value
+    }
+}
+
+/// A bitmap subtitle stream drawn onto the video during an encode.
+struct SubtitleBurnIn: Equatable, Sendable {
+    /// Absolute source stream index of the subtitle.
+    let streamID: Int
+    /// Subtitle sync offset; positive values show cues later.
+    var offsetSeconds: Double = 0
+
+    /// A burn-in for the selected embedded subtitle when it is a bitmap track.
+    static func selected(in info: MediaInfo, selection: TrackSelection,
+                         syncAdjustment: SyncAdjustment = .zero) -> SubtitleBurnIn? {
+        guard selection.hasSelectedSubtitle, let id = selection.subtitle.embeddedID,
+              info.subtitleTracks.first(where: { $0.id == id })?.isBitmapSubtitle == true else { return nil }
+        return SubtitleBurnIn(streamID: id, offsetSeconds: Double(syncAdjustment.subtitleMilliseconds) / 1000)
+    }
+
+    /// Graphics brightness for HDR video. Bitmap subtitles are authored for
+    /// SDR, so full-range white would map to peak brightness on PQ (10,000
+    /// nits) or HLG video. ITU-R BT.2408 puts graphics white at 203 cd/m²,
+    /// which is 58% of the PQ signal range and 75% of the HLG range.
+    static func hdrGraphicsScale(for transfer: String?) -> Double? {
+        switch transfer {
+        case "smpte2084": return 0.58
+        case "arib-std-b67": return 0.75
+        default: return nil
+        }
+    }
+}
+
+/// Builds the video filter arguments for an encode.
+///
+/// Without burn-in this is a plain `-vf` chain. With burn-in it is one
+/// `-filter_complex` graph whose output `[v]` replaces `0:v:0` in the
+/// stream mapping: deinterlace the video, overlay the subtitle, then scale
+/// and set the output format or colour tags, so the subtitle is scaled with
+/// the picture. The subtitle canvas is centred and bottom-aligned, which keeps
+/// cues on screen when a Blu-ray canvas (1920×1080) is taller than a cropped
+/// video (for example 1920×800).
+///
+/// The subtitle is read from a second input of the same file. FFmpeg times
+/// bitmap subtitles from the video packets of their own input in decode
+/// order, so with B-frames in the source, cues drawn from the first input
+/// start late and stay up to 0.2 s too long. A separate input keeps cues
+/// frame-accurate without buffering video across long subtitle gaps.
+enum VideoFilterGraph {
+    static let outputLabel = "[v]"
+    static let subtitleInput = 1
+
+    static func arguments(pre: [String], post: [String], burnIn: SubtitleBurnIn?, info: MediaInfo) -> [String] {
+        guard let burnIn else {
+            let filters = pre + post
+            return filters.isEmpty ? [] : ["-vf", filters.joined(separator: ",")]
+        }
+        var subtitle: [String] = []
+        if burnIn.offsetSeconds != 0 {
+            subtitle.append("setpts=PTS+\(String(format: "%.3f", burnIn.offsetSeconds))/TB")
+        }
+        if let scale = SubtitleBurnIn.hdrGraphicsScale(for: info.hdrTransfer) {
+            subtitle.append("colorchannelmixer=rr=\(scale):gg=\(scale):bb=\(scale)")
+        }
+        let base = "[0:v:0]" + (pre.isEmpty ? "null" : pre.joined(separator: ",")) + "[base]"
+        let sub = "[\(subtitleInput):\(burnIn.streamID)]" + (subtitle.isEmpty ? "null" : subtitle.joined(separator: ",")) + "[sub]"
+        let overlay = "[base][sub]" + (["overlay=x=(W-w)/2:y=H-h:eof_action=pass:format=auto"] + post)
+            .joined(separator: ",") + outputLabel
+        return ["-filter_complex", [base, sub, overlay].joined(separator: ";")]
     }
 }
 
@@ -637,16 +717,32 @@ enum TranscodePlanner {
                      syncAdjustment: SyncAdjustment = .zero,
                      requiresSubtitleMuxing: Bool = false,
                      surroundEncoder: SurroundAudioEncoder = .eac3,
-                     deinterlaceFilter: String? = Deinterlace.filter) -> ConversionPlan {
+                     deinterlaceFilter: String? = Deinterlace.filter,
+                     burnInSubtitle: SubtitleBurnIn? = nil) -> ConversionPlan {
+        let plan = basePlan(info: info, intent: intent, selectedAudioID: selectedAudioID,
+                            audioProcessingMode: audioProcessingMode, syncAdjustment: syncAdjustment,
+                            requiresSubtitleMuxing: requiresSubtitleMuxing, surroundEncoder: surroundEncoder,
+                            deinterlaceFilter: deinterlaceFilter, burnInSubtitle: burnInSubtitle)
+        guard burnInSubtitle != nil, plan.steps.allSatisfy(\.burnsInSubtitle), !plan.steps.isEmpty else { return plan }
+        return ConversionPlan(intent: intent, steps: plan.steps,
+            reason: "The selected bitmap subtitle is burned into the video, which needs a full video encode.")
+    }
+
+    private static func basePlan(info: MediaInfo, intent: PlaybackIntent, selectedAudioID: Int?,
+                                 audioProcessingMode: AudioProcessingMode, syncAdjustment: SyncAdjustment,
+                                 requiresSubtitleMuxing: Bool, surroundEncoder: SurroundAudioEncoder,
+                                 deinterlaceFilter: String?, burnInSubtitle: SubtitleBurnIn?) -> ConversionPlan {
         let video = info.videoCodec?.lowercased()
         let appleTVIssues = intent == .airPlay ? AppleTVVideoCompatibility.issues(for: info) : []
         // Local playback copies any H.264/HEVC. AirPlay copies only video the Apple TV decodes.
-        let canCopyVideo = ["h264", "hevc"].contains(video) && appleTVIssues.isEmpty
+        // A burned-in subtitle needs the video re-encoded for either intent.
+        let canCopyVideo = ["h264", "hevc"].contains(video) && appleTVIssues.isEmpty && burnInSubtitle == nil
         let conforming = intent == .airPlay ? AppleTVVideoCompatibility.conformingArguments(for: info)
                                             : (filters: [], output: [])
-        let h264Filters = Deinterlace.filters(for: info, filter: deinterlaceFilter) + conforming.filters
-            + ["format=yuv420p"]
-        let h264Encode = ["-vf", h264Filters.joined(separator: ",")] + conforming.output
+        let h264Encode = VideoFilterGraph.arguments(pre: Deinterlace.filters(for: info, filter: deinterlaceFilter),
+                                                    post: conforming.filters + ["format=yuv420p"],
+                                                    burnIn: burnInSubtitle, info: info)
+            + conforming.output
             + ["-c:v", "h264_videotoolbox",
                "-b:v", "\(VideoBitRate.kilobits(for: info, intent: intent, target: .h264))k"]
         let audioTrack = info.audioTracks.first(where: { $0.id == selectedAudioID }) ?? info.audioTracks.first
@@ -664,11 +760,13 @@ enum TranscodePlanner {
             return audioVariants.map {
                 ConversionStep(strategy: strategy, reason: reason, videoArguments: videoArguments,
                     audioArguments: $0, requiresHVC1: requiresHVC1,
-                    audioProcessingMode: audioProcessingMode, requiredTransfer: requiredTransfer)
+                    audioProcessingMode: audioProcessingMode, requiredTransfer: requiredTransfer,
+                    burnsInSubtitle: burnInSubtitle != nil)
             }
         }
 
-        if audioProcessingMode == .standard, syncAdjustment.isZero, !requiresSubtitleMuxing, intent == .local,
+        if audioProcessingMode == .standard, syncAdjustment.isZero, !requiresSubtitleMuxing, burnInSubtitle == nil,
+           intent == .local,
            ["mov,mp4,m4a,3gp,3g2,mj2", "mp4", "mov"].contains(info.formatName),
            ["h264", "hevc"].contains(video),
            [nil, "aac", "ac3", "eac3"].contains(audio) {
@@ -713,7 +811,7 @@ enum TranscodePlanner {
             return ConversionPlan(intent: intent, steps: remux + encodeSteps(strategy: .hardwareEncode,
                     reason: "Re-encode HDR as HEVC Main 10 when the lossless HDR remux is rejected.",
                     videoArguments: HDRVideoArguments.hevcMain10(for: info, intent: intent,
-                        deinterlaceFilter: deinterlaceFilter),
+                        deinterlaceFilter: deinterlaceFilter, burnIn: burnInSubtitle),
                     requiresHVC1: true, requiredTransfer: info.hdrTransfer), reason: reason)
         }
 
@@ -724,7 +822,7 @@ enum TranscodePlanner {
             return ConversionPlan(intent: intent, steps: encodeSteps(strategy: .hardwareEncode,
                     reason: "Encode HDR video as HEVC Main 10, keeping its HDR signalling.",
                     videoArguments: HDRVideoArguments.hevcMain10(for: info, intent: intent,
-                        deinterlaceFilter: deinterlaceFilter),
+                        deinterlaceFilter: deinterlaceFilter, burnIn: burnInSubtitle),
                     requiresHVC1: true, requiredTransfer: transfer), reason: "HDR \((video ?? "video").uppercased()) needs a 10-bit HEVC copy to keep HDR on Apple TV.")
         }
 
@@ -742,7 +840,7 @@ enum TranscodePlanner {
                 audioArguments: encodedAudio, requiresHVC1: video == "hevc",
                 audioProcessingMode: audioProcessingMode))
         }
-        if audioProcessingMode == .lateNight && steps.isEmpty && intent == .local {
+        if audioProcessingMode == .lateNight && steps.isEmpty && intent == .local && burnInSubtitle == nil {
             steps.append(ConversionStep(strategy: .audioTranscode,
                 reason: "Re-encode audio with the optional late-night dialogue-focused preset.",
                 videoArguments: ["-c:v", "copy"],

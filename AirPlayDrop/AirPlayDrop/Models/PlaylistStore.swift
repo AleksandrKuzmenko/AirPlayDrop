@@ -224,7 +224,9 @@ final class PlaylistStore {
                     selectedAudioID: item.trackSelection.audioID,
                     audioProcessingMode: item.audioProcessingMode,
                     syncAdjustment: item.syncAdjustment,
-                    requiresSubtitleMuxing: item.trackSelection.hasSelectedSubtitle)
+                    requiresSubtitleMuxing: item.trackSelection.hasSelectedSubtitle,
+                    burnInSubtitle: SubtitleBurnIn.selected(in: info, selection: item.trackSelection,
+                                                            syncAdjustment: item.syncAdjustment))
                 item.preparationReason = plan.reason
 
                 var cachedURL: URL?

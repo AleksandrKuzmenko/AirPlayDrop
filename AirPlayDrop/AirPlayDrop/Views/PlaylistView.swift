@@ -94,13 +94,16 @@ struct PlaylistView: View {
                                     if item.trackSelection.subtitle.isNone { Label("None", systemImage: "checkmark") }
                                     else { Text("None") }
                                 }
-                                ForEach(info.subtitleTracks.filter(\.isTextSubtitle)) { track in
+                                // Bitmap tracks (PGS, VobSub) can't go into MP4, so choosing
+                                // one burns it into the picture with a full video encode.
+                                ForEach(info.subtitleTracks.filter { $0.isTextSubtitle || $0.isBitmapSubtitle }) { track in
+                                    let name = track.isBitmapSubtitle ? track.displayName + " (burned in)" : track.displayName
                                     Button {
                                         onChooseSubtitle(item, track.id)
                                     } label: {
                                         if item.trackSelection.subtitleID == track.id {
-                                            Label(track.displayName, systemImage: "checkmark")
-                                        } else { Text(track.displayName) }
+                                            Label(name, systemImage: "checkmark")
+                                        } else { Text(name) }
                                     }
                                 }
                                 if let external = item.selectedExternalSubtitle {

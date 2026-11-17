@@ -896,6 +896,101 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertNil(TranscodeService.deinterlaceFilter(available: ["scale"]))
     }
 
+    private func withPGS(_ source: MediaInfo) -> MediaInfo {
+        var info = source
+        info = MediaInfo(formatName: info.formatName, duration: info.duration, videoCodec: info.videoCodec,
+            videoProfile: info.videoProfile, pixelFormat: info.pixelFormat, colorTransfer: info.colorTransfer,
+            isDolbyVision: info.isDolbyVision, tracks: info.tracks + [
+                MediaTrack(id: 3, kind: .subtitle, codec: "hdmv_pgs_subtitle", language: "eng", title: nil,
+                           channels: nil, isDefault: false, isTextSubtitle: false),
+                MediaTrack(id: 4, kind: .subtitle, codec: "subrip", language: "eng", title: nil,
+                           channels: nil, isDefault: false, isTextSubtitle: true)],
+            dolbyVisionProfile: info.dolbyVisionProfile, colorPrimaries: info.colorPrimaries,
+            colorSpace: info.colorSpace, width: info.width, height: info.height,
+            averageFrameRate: info.averageFrameRate, fieldOrder: info.fieldOrder)
+        return info
+    }
+
+    func testBitmapSubtitleSelectionBecomesBurnIn() {
+        let source = withPGS(video("h264", profile: "High", pixelFormat: "yuv420p"))
+        XCTAssertTrue(source.subtitleTracks[0].isBitmapSubtitle)
+        XCTAssertFalse(source.subtitleTracks[1].isBitmapSubtitle)
+        let pgs = TrackSelection(audioID: 2, subtitleID: 3, subtitlePolicy: .includeSelected)
+        XCTAssertEqual(SubtitleBurnIn.selected(in: source, selection: pgs,
+            syncAdjustment: SyncAdjustment(audioMilliseconds: 0, subtitleMilliseconds: -250)),
+            SubtitleBurnIn(streamID: 3, offsetSeconds: -0.25))
+        XCTAssertNil(SubtitleBurnIn.selected(in: source, selection: TrackSelection(audioID: 2, subtitleID: 4,
+                                                                                   subtitlePolicy: .includeSelected)))
+        XCTAssertNil(SubtitleBurnIn.selected(in: source, selection: TrackSelection(audioID: 2, subtitleID: 3)))
+        // Automatic selection stays text-only, so a bitmap track never forces an encode by default.
+        var preferences = PlaybackPreferences()
+        preferences.subtitleDefaultMode = .preferred
+        preferences.preferredSubtitleLanguages = ["en"]
+        XCTAssertEqual(FFprobeService.defaultSelection(from: source, preferences: preferences).subtitleID, 4)
+    }
+
+    func testBurnInPlansNeverCopyVideoAndUseOneFilterGraph() {
+        let burn = SubtitleBurnIn(streamID: 3)
+        let sdr = withPGS(video("h264", profile: "High", pixelFormat: "yuv420p"))
+        for intent in [PlaybackIntent.local, .airPlay] {
+            for mode in [AudioProcessingMode.standard, .lateNight] {
+                let plan = TranscodePlanner.plan(info: sdr, intent: intent, selectedAudioID: 2,
+                    audioProcessingMode: mode, requiresSubtitleMuxing: true, burnInSubtitle: burn)
+                XCTAssertEqual(plan.reason, "The selected bitmap subtitle is burned into the video, which needs a full video encode.")
+                XCTAssertFalse(plan.steps.isEmpty)
+                for step in plan.steps {
+                    XCTAssertEqual(step.strategy, .hardwareEncode)
+                    XCTAssertTrue(step.burnsInSubtitle)
+                    XCTAssertFalse(step.videoArguments.contains("copy"))
+                    XCTAssertFalse(step.videoArguments.contains("-vf"))
+                }
+            }
+        }
+        let step = TranscodePlanner.plan(info: sdr, intent: .airPlay, selectedAudioID: 2, burnInSubtitle: burn).steps[0]
+        XCTAssertEqual(step.videoArguments, ["-filter_complex",
+            "[0:v:0]null[base];[1:3]null[sub];[base][sub]overlay=x=(W-w)/2:y=H-h:eof_action=pass:format=auto,format=yuv420p[v]",
+            "-c:v", "h264_videotoolbox", "-b:v", "7800k"])
+    }
+
+    func testBurnInGraphOrdersDeinterlaceOverlayScaleAndDimsHDR() {
+        var hdr = withPGS(video("hevc", profile: "Main 10", pixelFormat: "yuv420p10le", width: 7680, height: 4320,
+                                frameRate: "25/1", hdr: false))
+        hdr = MediaInfo(formatName: hdr.formatName, duration: hdr.duration, videoCodec: "hevc", videoProfile: "Main 10",
+            pixelFormat: "yuv420p10le", colorTransfer: "smpte2084", isDolbyVision: false, tracks: hdr.tracks,
+            width: 7680, height: 4320, averageFrameRate: "25/1", fieldOrder: "tt")
+        let plan = TranscodePlanner.plan(info: hdr, intent: .airPlay, selectedAudioID: 2,
+                                         burnInSubtitle: SubtitleBurnIn(streamID: 3, offsetSeconds: 0.4))
+        XCTAssertFalse(plan.steps.contains { $0.strategy == .hdrRemux })
+        let graph = plan.steps[0].videoArguments[1]
+        XCTAssertEqual(graph,
+            "[0:v:0]bwdif=mode=send_field:parity=auto:deint=all[base];"
+            + "[1:3]setpts=PTS+0.400/TB,colorchannelmixer=rr=0.58:gg=0.58:bb=0.58[sub];"
+            + "[base][sub]overlay=x=(W-w)/2:y=H-h:eof_action=pass:format=auto,"
+            + "scale=w=4096:h=2160:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            + "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc[v]")
+        XCTAssertEqual(SubtitleBurnIn.hdrGraphicsScale(for: "arib-std-b67"), 0.75)
+        XCTAssertNil(SubtitleBurnIn.hdrGraphicsScale(for: nil))
+    }
+
+    func testBurnInArgumentsMapGraphOutputAndDropSubtitleStream() throws {
+        let sdr = withPGS(video("h264", profile: "High", pixelFormat: "yuv420p"))
+        let step = TranscodePlanner.plan(info: sdr, intent: .local, selectedAudioID: 2,
+                                         burnInSubtitle: SubtitleBurnIn(streamID: 3)).steps[0]
+        let selection = TrackSelection(audioID: 2, subtitleID: 3, subtitlePolicy: .includeSelected)
+        let args = try TranscodeService.ffmpegArguments(input: URL(fileURLWithPath: "/in.mkv"),
+            output: URL(fileURLWithPath: "/out.mp4"), step: step, selection: selection, sourceHasAudio: true,
+            syncAdjustment: SyncAdjustment(audioMilliseconds: 0, subtitleMilliseconds: 400))
+        let maps = args.indices.filter { args[$0] == "-map" }.map { args[$0 + 1] }
+        XCTAssertEqual(maps, ["[v]", "0:2"])
+        XCTAssertTrue(args.contains("-filter_complex"))
+        // The subtitle is read from a second input of the same file.
+        XCTAssertEqual(args.indices.filter { args[$0] == "-i" }.map { args[$0 + 1] }, ["/in.mkv", "/in.mkv"])
+        XCTAssertTrue(args.contains("-sn"))
+        XCTAssertFalse(args.contains("mov_text"))
+        XCTAssertFalse(args.contains("-bsf:s"))
+        XCTAssertEqual(Array(args.suffix(3)), ["-movflags", "+faststart", "/out.mp4"])
+    }
+
     func testProbeToleratesUnexpectedSideDataFieldTypes() throws {
         let data = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","side_data_list":[{"side_data_type":7,"rotation":"ninety","dv_profile":"eight"}]}],"format":{"format_name":"mp4","duration":"1.0"}}"#.data(using: .utf8)!
         let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))

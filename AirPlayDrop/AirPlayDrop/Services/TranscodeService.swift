@@ -14,6 +14,7 @@ enum TranscodeError: LocalizedError {
     case externalSubtitleUnavailable(String)
     case audioFilterUnavailable(String)
     case av1DecoderUnavailable
+    case subtitleBurnInUnavailable(String)
 
     var errorDescription: String? {
         switch self {
@@ -29,6 +30,8 @@ enum TranscodeError: LocalizedError {
         case .audioFilterUnavailable(let details): return "Late Night audio is unavailable: \(details)"
         case .av1DecoderUnavailable:
             return "This video uses AV1, which the selected FFmpeg cannot decode on this Mac. Use the bundled FFmpeg or a build that includes libdav1d."
+        case .subtitleBurnInUnavailable(let details):
+            return "The selected subtitle cannot be burned into the video: \(details)"
         }
     }
 }
@@ -244,6 +247,21 @@ enum TranscodeService {
             if offset != 0 { arguments += ["-itsoffset", String(format: "%.3f", offset)] }
             arguments += ["-i", descriptor.standardizedURL.path]
         }
+        if step.burnsInSubtitle {
+            // The filter graph reads the subtitle from a second input of the
+            // same file and outputs [v]; see VideoFilterGraph for why.
+            arguments += ["-i", input.path]
+            var videoOnly = selection
+            videoOnly.subtitle = .none
+            videoOnly.subtitlePolicy = .omit
+            var mapping = try streamArguments(selection: videoOnly, sourceHasAudio: sourceHasAudio)
+            if let video = mapping.firstIndex(of: "0:v:0") { mapping[video] = VideoFilterGraph.outputLabel }
+            return arguments + mapping + step.videoArguments
+                + (selection.audioID != nil ? step.audioArguments : [])
+                + (selection.audioID != nil ? audioFilter(for: syncAdjustment, mode: step.audioProcessingMode,
+                                                          mediaDuration: mediaDuration).map { ["-af", $0] } ?? [] : [])
+                + ["-movflags", "+faststart", output.path]
+        }
         arguments += try streamArguments(selection: selection, sourceHasAudio: sourceHasAudio,
                                          hasExternalSubtitleInput: selection.subtitle.externalDescriptor != nil)
         arguments += step.videoArguments
@@ -312,12 +330,24 @@ enum TranscodeService {
                 logger.warning("FFmpeg has no bwdif or yadif filter; interlaced video is encoded without deinterlacing.")
             }
         }
+        let burnIn = SubtitleBurnIn.selected(in: info, selection: selection, syncAdjustment: syncAdjustment)
+        if burnIn != nil {
+            if info.isDolbyVisionProfile5 {
+                throw TranscodeError.subtitleBurnInUnavailable("Dolby Vision profile 5 video cannot be re-encoded without wrong colours. Choose a text subtitle or none.")
+            }
+            let filters = await filterNames(using: installation)
+            let needed = ["overlay", "setpts", "colorchannelmixer"]
+            guard needed.allSatisfy(filters.contains) else {
+                throw TranscodeError.subtitleBurnInUnavailable("the selected FFmpeg lacks the overlay, setpts, or colorchannelmixer filter. Use the bundled FFmpeg.")
+            }
+        }
         let plan = TranscodePlanner.plan(info: info, intent: intent, selectedAudioID: selection.audioID,
                                          audioProcessingMode: audioProcessingMode,
                                          syncAdjustment: syncAdjustment,
                                          requiresSubtitleMuxing: selection.hasSelectedSubtitle,
                                          surroundEncoder: surroundEncoder,
-                                         deinterlaceFilter: deinterlacer)
+                                         deinterlaceFilter: deinterlacer,
+                                         burnInSubtitle: burnIn)
         if plan.steps.isEmpty {
             return PreparedArtifact(url: input, strategy: .directPlay, reason: plan.reason, isAirPlayPrepared: false)
         }
