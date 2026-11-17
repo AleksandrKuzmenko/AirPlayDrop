@@ -13,11 +13,12 @@ The project is currently a **0.1.x alpha**. The release process produces an arm6
 - Preferred audio and subtitle languages for newly imported files.
 - Automatic discovery and manual attachment of external `.srt`, `.vtt`, `.ass`, and `.ssa` subtitles.
 - Per-file audio and subtitle synchronization adjustment from -10 to +10 seconds.
+- Surround audio preserved for Apple TV: AAC, AC3, and E-AC3 tracks are copied unchanged, and other multichannel audio is converted to E-AC3 up to 5.1.
 - Optional Late Night audio processing for quieter peaks and clearer dialogue.
 - Resume playback for unfinished videos and timeline thumbnail previews while scrubbing.
 - Cancellable conversion, progress reporting, actionable FFmpeg diagnostics, and reuse of validated prepared copies.
 
-AirPlayDrop does not implement Chromecast, a phone remote, subtitle OCR, Atmos passthrough, or persistent multi-playlist management.
+AirPlayDrop does not implement Chromecast, a phone remote, subtitle OCR, Atmos from TrueHD sources, or persistent multi-playlist management.
 
 ## Requirements
 

@@ -106,7 +106,7 @@ cd "$build_dir"
   --disable-gpl \
   --disable-nonfree \
   --disable-encoders \
-  --enable-encoder=aac,h264_videotoolbox,hevc_videotoolbox,movtext \
+  --enable-encoder=aac,eac3,h264_videotoolbox,hevc_videotoolbox,movtext \
   --disable-muxers \
   --enable-muxer=mp4,mov \
   --disable-filters \
@@ -139,6 +139,7 @@ done
 "$install_dir/bin/ffmpeg" -hide_banner -encoders 2>&1 | grep -q 'h264_videotoolbox'
 "$install_dir/bin/ffmpeg" -hide_banner -encoders 2>&1 | grep -q 'hevc_videotoolbox'
 "$install_dir/bin/ffmpeg" -hide_banner -encoders 2>&1 | grep -q 'mov_text'
+"$install_dir/bin/ffmpeg" -hide_banner -encoders 2>&1 | grep -q ' eac3 '
 "$install_dir/bin/ffmpeg" -hide_banner -filters 2>&1 | grep -q 'acompressor'
 "$install_dir/bin/ffmpeg" -hide_banner -filters 2>&1 | grep -q 'alimiter'
 "$install_dir/bin/ffmpeg" -hide_banner -filters 2>&1 | grep -q 'adelay'

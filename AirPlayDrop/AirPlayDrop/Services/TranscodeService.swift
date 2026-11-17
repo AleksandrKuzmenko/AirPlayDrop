@@ -99,11 +99,19 @@ enum TranscodeService {
     }
 
     static func decoderNames(using installation: FFmpegInstallation) async -> Set<String> {
+        await codecNames(using: installation, listOption: "-decoders")
+    }
+
+    static func encoderNames(using installation: FFmpegInstallation) async -> Set<String> {
+        await codecNames(using: installation, listOption: "-encoders")
+    }
+
+    private static func codecNames(using installation: FFmpegInstallation, listOption: String) async -> Set<String> {
         await Task.detached {
             let process = Process()
             let output = Pipe()
             process.executableURL = installation.ffmpeg
-            process.arguments = ["-hide_banner", "-decoders"]
+            process.arguments = ["-hide_banner", listOption]
             process.standardOutput = output
             process.standardError = FileHandle.nullDevice
             do { try process.run() } catch { return [] }
@@ -114,7 +122,8 @@ enum TranscodeService {
         }.value
     }
 
-    /// Parses `ffmpeg -decoders` rows such as ` V....D libdav1d   dav1d AV1 decoder`.
+    /// Parses `ffmpeg -decoders` or `-encoders` rows such as
+    /// ` V....D libdav1d   dav1d AV1 decoder`.
     static func parseDecoderNames(_ text: String) -> Set<String> {
         var names: Set<String> = []
         // Legend rows (` V..... = Video`) precede a ` ------` separator; only
@@ -256,10 +265,13 @@ enum TranscodeService {
                 hasSoftwareAV1Decoder: decoders.contains("libdav1d"),
                 hasHardwareAV1Decoder: hasHardwareAV1Decoder)
         }
+        let surroundEncoder: SurroundAudioEncoder =
+            (await encoderNames(using: installation)).contains("eac3") ? .eac3 : .aac
         let plan = TranscodePlanner.plan(info: info, intent: intent, selectedAudioID: selection.audioID,
                                          audioProcessingMode: audioProcessingMode,
                                          syncAdjustment: syncAdjustment,
-                                         requiresSubtitleMuxing: selection.hasSelectedSubtitle)
+                                         requiresSubtitleMuxing: selection.hasSelectedSubtitle,
+                                         surroundEncoder: surroundEncoder)
         if plan.steps.isEmpty {
             return PreparedArtifact(url: input, strategy: .directPlay, reason: plan.reason, isAirPlayPrepared: false)
         }

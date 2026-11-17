@@ -10,6 +10,7 @@
 - HDR and Dolby Vision files that AVFoundation cannot open (such as MKV) are now re-prepared for Apple TV before AirPlay playback instead of streaming a local-only copy.
 - Fixed AV1 videos failing every preparation strategy: the bundled FFmpeg now includes the pinned dav1d 1.5.4 software decoder. With an external FFmpeg that lacks dav1d, AirPlayDrop uses VideoToolbox hardware decoding on Macs that support it and otherwise reports a clear error.
 - HDR10 and HLG sources that cannot be stream-copied, such as AV1 and VP9, are now encoded as 10-bit HEVC with explicit BT.2020 and PQ/HLG tags instead of 8-bit H.264. Prepared HDR copies are rejected if they lose their HDR transfer function. The bundled FFmpeg adds the `setparams` filter for this.
+- Surround audio is no longer always downmixed to stereo. AAC, AC3, and E-AC3 tracks are copied unchanged, keeping any Dolby Atmos in E-AC3. Other multichannel audio, such as DTS, TrueHD, FLAC, or Opus, is encoded as E-AC3 up to 5.1, with 7.1 downmixed to 5.1. The bundled FFmpeg adds the E-AC3 encoder; builds without it fall back to multichannel AAC. Stereo sources and Late Night mode stay stereo AAC. Copies prepared by earlier versions are re-prepared.
 - The FFmpeg build script now starts from an empty build directory so it keeps working after Xcode SDK updates.
 
 ## 0.1.0-alpha — 2026-09-22

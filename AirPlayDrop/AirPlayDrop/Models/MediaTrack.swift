@@ -209,7 +209,9 @@ enum AudioProcessingMode: String, Codable, CaseIterable, Sendable {
 }
 
 enum AudioProcessingPreset {
-    static let version = 1
+    /// Bumped to 2 when surround audio started being preserved, so stereo
+    /// copies prepared earlier are re-prepared.
+    static let version = 2
     static let lateNightFilter = "acompressor=threshold=-30dB:ratio=8:attack=5:release=250:makeup=8dB,alimiter=limit=-0.5dB"
 }
 
@@ -262,6 +264,47 @@ struct ConversionStep: Equatable, Sendable {
     }
 }
 
+/// Encoder used when surround audio has to be re-encoded.
+enum SurroundAudioEncoder: String, Sendable {
+    /// Dolby Digital Plus, which Apple TV can pass to a receiver or soundbar.
+    case eac3
+    /// Multichannel AAC, for FFmpeg builds without the E-AC3 encoder.
+    case aac
+}
+
+enum AudioArguments {
+    /// Codecs Apple TV accepts in MP4. Copying them keeps the original mix,
+    /// including any Dolby Atmos carried in E-AC3.
+    static let copyableCodecs: Set<String> = ["aac", "ac3", "eac3"]
+    static let stereo = ["-c:a", "aac", "-ac:a", "2", "-b:a", "192k"]
+
+    static func canCopy(_ track: MediaTrack?, mode: AudioProcessingMode, syncAdjustment: SyncAdjustment) -> Bool {
+        guard mode == .standard, syncAdjustment.audioMilliseconds == 0 else { return false }
+        guard let track else { return true }
+        return copyableCodecs.contains(track.codec.lowercased())
+    }
+
+    /// Re-encode the track, keeping up to 5.1 channels. Late Night output stays
+    /// stereo because the preset is meant for speakers at low volume.
+    static func encode(_ track: MediaTrack?, mode: AudioProcessingMode,
+                       surroundEncoder: SurroundAudioEncoder) -> [String] {
+        let channels = track?.channels ?? 2
+        guard mode == .standard, channels > 2 else { return stereo }
+        let output = min(channels, 6)
+        switch surroundEncoder {
+        case .eac3: return ["-c:a", "eac3", "-ac:a", "\(output)", "-b:a", output >= 6 ? "640k" : "448k"]
+        case .aac: return ["-c:a", "aac", "-ac:a", "\(output)", "-b:a", output >= 6 ? "384k" : "320k"]
+        }
+    }
+
+    static func preferred(_ track: MediaTrack?, mode: AudioProcessingMode, syncAdjustment: SyncAdjustment,
+                          surroundEncoder: SurroundAudioEncoder) -> [String] {
+        canCopy(track, mode: mode, syncAdjustment: syncAdjustment)
+            ? ["-c:a", "copy"]
+            : encode(track, mode: mode, surroundEncoder: surroundEncoder)
+    }
+}
+
 enum HDRVideoArguments {
     /// HEVC Main 10 VideoToolbox encode that keeps HDR10/HLG signalling.
     /// Apple TV only switches to HDR when the output carries colour tags.
@@ -298,10 +341,27 @@ enum TranscodePlanner {
     static func plan(info: MediaInfo, intent: PlaybackIntent, selectedAudioID: Int? = nil,
                      audioProcessingMode: AudioProcessingMode = .standard,
                      syncAdjustment: SyncAdjustment = .zero,
-                     requiresSubtitleMuxing: Bool = false) -> ConversionPlan {
+                     requiresSubtitleMuxing: Bool = false,
+                     surroundEncoder: SurroundAudioEncoder = .eac3) -> ConversionPlan {
         let video = info.videoCodec?.lowercased()
-        let audio = info.audioTracks.first(where: { $0.id == selectedAudioID })?.codec.lowercased()
-            ?? info.audioTracks.first?.codec.lowercased()
+        let audioTrack = info.audioTracks.first(where: { $0.id == selectedAudioID }) ?? info.audioTracks.first
+        let audio = audioTrack?.codec.lowercased()
+        let preferredAudio = AudioArguments.preferred(audioTrack, mode: audioProcessingMode,
+            syncAdjustment: syncAdjustment, surroundEncoder: surroundEncoder)
+        let encodedAudio = AudioArguments.encode(audioTrack, mode: audioProcessingMode,
+                                                 surroundEncoder: surroundEncoder)
+        // Video-encode steps copy compatible audio first. When that copy is in
+        // use, a second step with re-encoded audio follows as the fallback.
+        func encodeSteps(strategy: ConversionStrategy, reason: String, videoArguments: [String],
+                         requiresHVC1: Bool, requiredTransfer: String?) -> [ConversionStep] {
+            var audioVariants = [preferredAudio]
+            if preferredAudio != encodedAudio { audioVariants.append(encodedAudio) }
+            return audioVariants.map {
+                ConversionStep(strategy: strategy, reason: reason, videoArguments: videoArguments,
+                    audioArguments: $0, requiresHVC1: requiresHVC1,
+                    audioProcessingMode: audioProcessingMode, requiredTransfer: requiredTransfer)
+            }
+        }
 
         if audioProcessingMode == .standard, syncAdjustment.isZero, !requiresSubtitleMuxing, intent == .local,
            ["mov,mp4,m4a,3gp,3g2,mj2", "mp4", "mov"].contains(info.formatName),
@@ -315,53 +375,48 @@ enum TranscodePlanner {
                 ConversionStep(strategy: .hdrRemux,
                     reason: "Preserve the HEVC HDR base layer, remove Dolby Vision RPU data, and create an hvc1 MP4.",
                     videoArguments: ["-c:v", "copy", "-bsf:v", "filter_units=remove_types=62", "-tag:v", "hvc1"],
-                    audioArguments: ["-c:a", "aac", "-ac:a", "2", "-b:a", "192k"], requiresHVC1: true,
-                    audioProcessingMode: audioProcessingMode, requiredTransfer: info.hdrTransfer),
-                ConversionStep(strategy: .hardwareEncode,
+                    audioArguments: preferredAudio, requiresHVC1: true,
+                    audioProcessingMode: audioProcessingMode, requiredTransfer: info.hdrTransfer)
+            ] + encodeSteps(strategy: .hardwareEncode,
                     reason: "Re-encode HDR as HEVC Main 10 when the lossless HDR remux is rejected.",
                     videoArguments: HDRVideoArguments.hevcMain10(for: info),
-                    audioArguments: ["-c:a", "aac", "-ac:a", "2", "-b:a", "192k"], requiresHVC1: true,
-                    audioProcessingMode: audioProcessingMode, requiredTransfer: info.hdrTransfer)
-            ], reason: info.isDolbyVision ? "Dolby Vision needs an Apple TV compatible HDR10 fallback." : "HDR HEVC needs an AirPlay-safe MP4 sample entry.")
+                    requiresHVC1: true, requiredTransfer: info.hdrTransfer), reason: info.isDolbyVision ? "Dolby Vision needs an Apple TV compatible HDR10 fallback." : "HDR HEVC needs an AirPlay-safe MP4 sample entry.")
         }
 
         // AV1, VP9, and other HDR sources that cannot be stream-copied. The
         // generic H.264 encode would produce 8-bit video still tagged PQ/HLG,
         // so HDR is encoded as HEVC Main 10 instead, with no H.264 fallback.
         if let transfer = info.hdrTransfer, !["h264", "hevc"].contains(video) {
-            return ConversionPlan(intent: intent, steps: [
-                ConversionStep(strategy: .hardwareEncode,
+            return ConversionPlan(intent: intent, steps: encodeSteps(strategy: .hardwareEncode,
                     reason: "Encode HDR video as HEVC Main 10, keeping its HDR signalling.",
                     videoArguments: HDRVideoArguments.hevcMain10(for: info),
-                    audioArguments: ["-c:a", "aac", "-ac:a", "2", "-b:a", "192k"], requiresHVC1: true,
-                    audioProcessingMode: audioProcessingMode, requiredTransfer: transfer)
-            ], reason: "HDR \((video ?? "video").uppercased()) needs a 10-bit HEVC copy to keep HDR on Apple TV.")
+                    requiresHVC1: true, requiredTransfer: transfer), reason: "HDR \((video ?? "video").uppercased()) needs a 10-bit HEVC copy to keep HDR on Apple TV.")
         }
 
         var steps: [ConversionStep] = []
         if ["h264", "hevc"].contains(video) {
-            if audioProcessingMode == .standard && syncAdjustment.audioMilliseconds == 0 && (audio == "aac" || audio == nil) {
+            if AudioArguments.canCopy(audioTrack, mode: audioProcessingMode, syncAdjustment: syncAdjustment) {
                 steps.append(ConversionStep(strategy: .remux, reason: "Repackage compatible streams without quality loss.",
                     videoArguments: ["-c:v", "copy"] + (video == "hevc" ? ["-tag:v", "hvc1"] : []),
                     audioArguments: ["-c:a", "copy"], requiresHVC1: video == "hevc",
                     audioProcessingMode: audioProcessingMode))
             }
-            steps.append(ConversionStep(strategy: .audioTranscode, reason: "Keep compatible video and convert the selected audio track to AAC.",
+            steps.append(ConversionStep(strategy: .audioTranscode,
+                reason: "Keep compatible video and convert the selected audio track to an Apple TV compatible format.",
                 videoArguments: ["-c:v", "copy"] + (video == "hevc" ? ["-tag:v", "hvc1"] : []),
-                audioArguments: ["-c:a", "aac", "-ac:a", "2", "-b:a", "192k"], requiresHVC1: video == "hevc",
+                audioArguments: encodedAudio, requiresHVC1: video == "hevc",
                 audioProcessingMode: audioProcessingMode))
         }
         if audioProcessingMode == .lateNight && steps.isEmpty {
             steps.append(ConversionStep(strategy: .audioTranscode,
                 reason: "Re-encode audio with the optional late-night dialogue-focused preset.",
                 videoArguments: ["-c:v", "copy"],
-                audioArguments: ["-c:a", "aac", "-ac:a", "2", "-b:a", "192k"],
+                audioArguments: encodedAudio,
                 requiresHVC1: video == "hevc", audioProcessingMode: .lateNight))
         }
-        steps.append(ConversionStep(strategy: .hardwareEncode, reason: "Use Apple hardware encoding for broad playback compatibility.",
-            videoArguments: ["-c:v", "h264_videotoolbox", "-b:v", "5000k"],
-            audioArguments: ["-c:a", "aac", "-ac:a", "2", "-b:a", "192k"], requiresHVC1: false,
-            audioProcessingMode: audioProcessingMode))
+        steps += encodeSteps(strategy: .hardwareEncode, reason: "Use Apple hardware encoding for broad playback compatibility.",
+            videoArguments: ["-c:v", "h264_videotoolbox", "-b:v", "5000k"], requiresHVC1: false,
+            requiredTransfer: nil)
         return ConversionPlan(intent: intent, steps: steps, reason: "Prepare a compatible MP4 using the least destructive available strategy.")
     }
 }

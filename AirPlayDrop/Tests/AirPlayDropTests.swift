@@ -152,6 +152,83 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertNil(steps[0].requiredTransfer)
     }
 
+    private func audioTrack(_ codec: String, channels: Int?) -> MediaTrack {
+        MediaTrack(id: 2, kind: .audio, codec: codec, language: "eng", title: nil,
+                   channels: channels, isDefault: true, isTextSubtitle: false)
+    }
+
+    func testCompatibleAudioIsCopiedOnlyWithoutProcessing() {
+        for codec in ["aac", "ac3", "eac3", "AC3"] {
+            XCTAssertEqual(AudioArguments.preferred(audioTrack(codec, channels: 6), mode: .standard,
+                syncAdjustment: .zero, surroundEncoder: .eac3), ["-c:a", "copy"], codec)
+        }
+        XCTAssertFalse(AudioArguments.canCopy(audioTrack("eac3", channels: 6), mode: .lateNight, syncAdjustment: .zero))
+        XCTAssertFalse(AudioArguments.canCopy(audioTrack("eac3", channels: 6), mode: .standard,
+                                              syncAdjustment: SyncAdjustment(audioMilliseconds: 200)))
+        XCTAssertTrue(AudioArguments.canCopy(audioTrack("eac3", channels: 6), mode: .standard,
+                                             syncAdjustment: SyncAdjustment(subtitleMilliseconds: 200)))
+        XCTAssertFalse(AudioArguments.canCopy(audioTrack("dts", channels: 6), mode: .standard, syncAdjustment: .zero))
+    }
+
+    func testSurroundAudioIsEncodedAsEAC3UpTo51() {
+        XCTAssertEqual(AudioArguments.encode(audioTrack("truehd", channels: 8), mode: .standard, surroundEncoder: .eac3),
+                       ["-c:a", "eac3", "-ac:a", "6", "-b:a", "640k"])
+        XCTAssertEqual(AudioArguments.encode(audioTrack("dts", channels: 6), mode: .standard, surroundEncoder: .eac3),
+                       ["-c:a", "eac3", "-ac:a", "6", "-b:a", "640k"])
+        XCTAssertEqual(AudioArguments.encode(audioTrack("flac", channels: 4), mode: .standard, surroundEncoder: .eac3),
+                       ["-c:a", "eac3", "-ac:a", "4", "-b:a", "448k"])
+        XCTAssertEqual(AudioArguments.encode(audioTrack("dts", channels: 6), mode: .standard, surroundEncoder: .aac),
+                       ["-c:a", "aac", "-ac:a", "6", "-b:a", "384k"])
+    }
+
+    func testStereoAndLateNightAudioStayStereoAAC() {
+        XCTAssertEqual(AudioArguments.encode(audioTrack("opus", channels: 2), mode: .standard, surroundEncoder: .eac3),
+                       AudioArguments.stereo)
+        XCTAssertEqual(AudioArguments.encode(audioTrack("mp3", channels: nil), mode: .standard, surroundEncoder: .eac3),
+                       AudioArguments.stereo)
+        XCTAssertEqual(AudioArguments.encode(audioTrack("dts", channels: 6), mode: .lateNight, surroundEncoder: .eac3),
+                       AudioArguments.stereo)
+    }
+
+    func testAirPlayPlanKeepsSurroundForDTSInMKV() {
+        let source = MediaInfo(formatName: "matroska,webm", duration: 120, videoCodec: "h264",
+            videoProfile: "High", pixelFormat: "yuv420p", colorTransfer: nil, isDolbyVision: false,
+            tracks: [audioTrack("dts", channels: 6)])
+        let steps = TranscodePlanner.plan(info: source, intent: .airPlay, selectedAudioID: 2).steps
+        XCTAssertEqual(steps.map(\.strategy), [.audioTranscode, .hardwareEncode])
+        for step in steps { XCTAssertEqual(step.audioArguments, ["-c:a", "eac3", "-ac:a", "6", "-b:a", "640k"]) }
+        let aacOnly = TranscodePlanner.plan(info: source, intent: .airPlay, selectedAudioID: 2,
+                                            surroundEncoder: .aac).steps
+        XCTAssertEqual(aacOnly.first?.audioArguments, ["-c:a", "aac", "-ac:a", "6", "-b:a", "384k"])
+    }
+
+    func testAirPlayPlanCopiesEAC3AndFallsBackToEncodedAudio() {
+        let source = MediaInfo(formatName: "matroska,webm", duration: 120, videoCodec: "mpeg2video",
+            videoProfile: nil, pixelFormat: "yuv420p", colorTransfer: nil, isDolbyVision: false,
+            tracks: [audioTrack("eac3", channels: 6)])
+        let steps = TranscodePlanner.plan(info: source, intent: .airPlay, selectedAudioID: 2).steps
+        XCTAssertEqual(steps.map(\.strategy), [.hardwareEncode, .hardwareEncode])
+        XCTAssertEqual(steps[0].audioArguments, ["-c:a", "copy"])
+        XCTAssertEqual(steps[1].audioArguments, ["-c:a", "eac3", "-ac:a", "6", "-b:a", "640k"])
+
+        let h264 = MediaInfo(formatName: "matroska,webm", duration: 120, videoCodec: "h264",
+            videoProfile: "High", pixelFormat: "yuv420p", colorTransfer: nil, isDolbyVision: false,
+            tracks: [audioTrack("ac3", channels: 6)])
+        let remux = TranscodePlanner.plan(info: h264, intent: .airPlay, selectedAudioID: 2).steps.first
+        XCTAssertEqual(remux?.strategy, .remux)
+        XCTAssertEqual(remux?.audioArguments, ["-c:a", "copy"])
+    }
+
+    func testHDRRemuxCopiesCompatibleSurround() {
+        let source = MediaInfo(formatName: "matroska,webm", duration: 120, videoCodec: "hevc",
+            videoProfile: "Main 10", pixelFormat: "yuv420p10le", colorTransfer: "smpte2084", isDolbyVision: true,
+            tracks: [audioTrack("eac3", channels: 6)])
+        let steps = TranscodePlanner.plan(info: source, intent: .airPlay, selectedAudioID: 2).steps
+        XCTAssertEqual(steps.map(\.strategy), [.hdrRemux, .hardwareEncode, .hardwareEncode])
+        XCTAssertEqual(steps[0].audioArguments, ["-c:a", "copy"])
+        XCTAssertEqual(steps[2].audioArguments.first(where: { $0 == "eac3" }), "eac3")
+    }
+
     func testNonHEVCHDRIsEncodedAsTaggedHEVCMain10() {
         for intent in PlaybackIntent.allCases {
             for (codec, transfer) in [("vp9", "smpte2084"), ("av1", "arib-std-b67")] {
@@ -187,9 +264,12 @@ final class AirPlayDropTests: XCTestCase {
 
     func testHEVCHDRAirPlayStepsRequireTransferAndTagTheEncode() {
         let steps = TranscodePlanner.plan(info: info(hdr: true), intent: .airPlay).steps
-        XCTAssertEqual(steps.map(\.strategy), [.hdrRemux, .hardwareEncode])
-        XCTAssertEqual(steps.map(\.requiredTransfer), ["smpte2084", "smpte2084"])
+        // The 5.1 AAC source is copied first; the last encode re-encodes it.
+        XCTAssertEqual(steps.map(\.strategy), [.hdrRemux, .hardwareEncode, .hardwareEncode])
+        XCTAssertEqual(steps.map(\.requiredTransfer), ["smpte2084", "smpte2084", "smpte2084"])
         XCTAssertTrue(steps[1].videoArguments.contains("-vf"))
+        XCTAssertEqual(steps[1].audioArguments, ["-c:a", "copy"])
+        XCTAssertEqual(steps[2].audioArguments, ["-c:a", "eac3", "-ac:a", "6", "-b:a", "640k"])
     }
 
     func testTransferNamesMapToCoreMediaValues() {
@@ -299,7 +379,9 @@ final class AirPlayDropTests: XCTestCase {
             output: URL(fileURLWithPath: "/out.mp4"), step: step,
             selection: TrackSelection(audioID: 2, subtitleID: nil), sourceHasAudio: true)
         XCTAssertTrue(args.windows(ofCount: 2).contains { Array($0) == ["-map", "0:2"] })
-        XCTAssertTrue(args.contains("aac"))
+        // The fixture's audio is 6-channel, so it is converted to E-AC3 5.1.
+        XCTAssertTrue(args.windows(ofCount: 2).contains { Array($0) == ["-c:a", "eac3"] })
+        XCTAssertTrue(args.windows(ofCount: 2).contains { Array($0) == ["-ac:a", "6"] })
         XCTAssertEqual(args.last, "/out.mp4")
     }
 
