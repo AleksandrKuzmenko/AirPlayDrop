@@ -75,6 +75,14 @@ struct MediaInfo: Codable, Equatable, Sendable {
     var height: Int? = nil
     /// FFprobe `avg_frame_rate`, a rational such as `24000/1001`; `0/0` when unknown.
     var averageFrameRate: String? = nil
+    /// Video stream bit rate in bit/s, from the stream or its Matroska `BPS` tag.
+    var videoBitRate: Int? = nil
+    /// Whole-file bit rate in bit/s, used when the video stream has none.
+    var containerBitRate: Int? = nil
+
+    /// Best available estimate of the source video bit rate. The container
+    /// rate includes audio, so it errs high, which is safe for a ceiling.
+    var estimatedVideoBitRate: Int? { videoBitRate ?? containerBitRate }
 
     /// Frames per second, or nil when FFprobe could not determine the rate.
     var frameRate: Double? {
@@ -329,7 +337,7 @@ enum HDRVideoArguments {
         let filters = limits.filters + [colorFilter(for: info)].compactMap { $0 }
         return (filters.isEmpty ? [] : ["-vf", filters.joined(separator: ",")]) + limits.output
             + ["-c:v", "hevc_videotoolbox", "-profile:v", "main10", "-pix_fmt", "p010le",
-               "-b:v", "12000k", "-tag:v", "hvc1"]
+               "-b:v", "\(HDRBitRate.kilobits(for: info, intent: intent))k", "-tag:v", "hvc1"]
     }
 
     static func colorFilter(for info: MediaInfo) -> String? {
@@ -342,6 +350,80 @@ enum HDRVideoArguments {
     private static func known(_ value: String?) -> String? {
         guard let value, !["unknown", "unspecified", "reserved"].contains(value) else { return nil }
         return value
+    }
+}
+
+/// Target bit rate for HEVC Main 10 HDR encodes.
+///
+/// The base rates are the highest HDR (HEVC) rung for each resolution in
+/// item 1.25 of Apple's HLS authoring specification, given for 30 fps. A
+/// single AirPlay stream on a home network has no adaptive ladder to fall
+/// back on, so it uses the top rung. Rates between rungs are interpolated
+/// by pixel count; larger or smaller frames scale with pixel count.
+///
+/// Apple says 24 fps HEVC should use about 20% less. It gives no figure for
+/// higher frame rates; AirPlayDrop adds half the 30 fps rate at 60 fps.
+/// A re-encode cannot add detail, so the target never exceeds the source's
+/// own bit rate by more than 25% when that is known.
+enum HDRBitRate {
+    /// (pixels, kbit/s at 30 fps)
+    static let ladder: [(pixels: Int, kilobits: Int)] = [
+        (960 * 540, 1_930),
+        (1280 * 720, 4_080),
+        (1920 * 1080, 7_000),
+        (2560 * 1440, 9_700),
+        (3840 * 2160, 20_000),
+    ]
+    static let minimumKilobits = 500
+    static let sourceHeadroom = 1.25
+
+    static func kilobits(for info: MediaInfo, intent: PlaybackIntent) -> Int {
+        let pixels = outputPixels(for: info, intent: intent)
+        var rate = Double(baseKilobits(forPixels: pixels)) * frameRateFactor(outputFrameRate(for: info, intent: intent))
+        if let source = info.estimatedVideoBitRate, source > 0 {
+            rate = min(rate, Double(source) / 1000 * sourceHeadroom)
+        }
+        return max(minimumKilobits, Int(rate.rounded()))
+    }
+
+    static func baseKilobits(forPixels pixels: Int) -> Int {
+        guard let first = ladder.first, let last = ladder.last else { return 0 }
+        if pixels <= first.pixels {
+            return Int((Double(first.kilobits) * Double(pixels) / Double(first.pixels)).rounded())
+        }
+        if pixels >= last.pixels {
+            return Int((Double(last.kilobits) * Double(pixels) / Double(last.pixels)).rounded())
+        }
+        for (lower, upper) in zip(ladder, ladder.dropFirst()) where pixels <= upper.pixels {
+            let fraction = Double(pixels - lower.pixels) / Double(upper.pixels - lower.pixels)
+            return Int((Double(lower.kilobits) + fraction * Double(upper.kilobits - lower.kilobits)).rounded())
+        }
+        return last.kilobits
+    }
+
+    static func frameRateFactor(_ rate: Double?) -> Double {
+        guard let rate, rate > 0 else { return 1 }
+        if rate < 24.5 { return 0.8 }
+        if rate <= 31 { return 1 }
+        return 1 + 0.5 * (rate - 30) / 30
+    }
+
+    /// Output pixels after any AirPlay downscale. Unknown sizes use 2160p
+    /// so quality is not reduced by a missing probe field.
+    static func outputPixels(for info: MediaInfo, intent: PlaybackIntent) -> Int {
+        guard let width = info.width, let height = info.height, width > 0, height > 0 else {
+            return 3840 * 2160
+        }
+        guard intent == .airPlay else { return width * height }
+        let scale = min(1, Double(AppleTVVideoCompatibility.maxLongSide) / Double(max(width, height)),
+                        Double(AppleTVVideoCompatibility.maxShortSide) / Double(min(width, height)))
+        return Int((Double(width) * scale).rounded()) * Int((Double(height) * scale).rounded())
+    }
+
+    static func outputFrameRate(for info: MediaInfo, intent: PlaybackIntent) -> Double? {
+        guard let rate = info.frameRate else { return nil }
+        guard intent == .airPlay, rate > AppleTVVideoCompatibility.frameRateLimit else { return rate }
+        return rate / (rate / AppleTVVideoCompatibility.frameRateLimit).rounded(.up)
     }
 }
 

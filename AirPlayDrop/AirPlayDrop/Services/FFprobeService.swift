@@ -90,6 +90,7 @@ struct FFprobeStream: Codable, Equatable, Sendable {
     var width: Int? = nil
     var height: Int? = nil
     var avg_frame_rate: String? = nil
+    var bit_rate: String? = nil
 
     var isForced: Bool { disposition?["forced"] == 1 }
 }
@@ -135,6 +136,7 @@ struct FFprobeSideData: Codable, Equatable, Sendable {
 struct FFprobeFormat: Codable, Equatable, Sendable {
     let format_name: String?
     let duration: String?
+    var bit_rate: String? = nil
 }
 
 struct FFprobeResult: Codable, Equatable, Sendable {
@@ -247,7 +249,17 @@ enum FFprobeService {
             colorPrimaries: video?.color_primaries,
             colorSpace: video?.color_space,
             width: video?.width, height: video?.height,
-            averageFrameRate: video?.avg_frame_rate)
+            averageFrameRate: video?.avg_frame_rate,
+            videoBitRate: video.flatMap(streamBitRate),
+            containerBitRate: result.format?.bit_rate.flatMap { Int($0) })
+    }
+
+    /// MP4 streams carry `bit_rate`; Matroska files muxed by mkvmerge carry a
+    /// `BPS` statistics tag instead, sometimes with a language suffix.
+    static func streamBitRate(_ stream: FFprobeStream) -> Int? {
+        if let rate = stream.bit_rate.flatMap({ Int($0) }) { return rate }
+        let tag = stream.tags?.first { $0.key.uppercased() == "BPS" || $0.key.uppercased().hasPrefix("BPS-") }
+        return tag.flatMap { Int($0.value) }
     }
 
     static func preferredAudio(from streams: [FFprobeStream], preferredLanguage: String? = Locale.current.language.languageCode?.identifier) -> FFprobeStream? {

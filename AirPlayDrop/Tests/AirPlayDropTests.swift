@@ -376,6 +376,60 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertFalse(compatible.needsAirPlayTranscode)
     }
 
+    private func hdrBitRate(width: Int?, height: Int?, frameRate: String?, source: Int? = nil,
+                            intent: PlaybackIntent = .airPlay) -> Int {
+        var info = video("vp9", profile: nil, pixelFormat: "yuv420p10le", width: width, height: height,
+                         frameRate: frameRate, hdr: true)
+        info.videoBitRate = source
+        return HDRBitRate.kilobits(for: info, intent: intent)
+    }
+
+    func testHDRBitRateFollowsAppleLadderForResolution() {
+        XCTAssertEqual(hdrBitRate(width: 1920, height: 1080, frameRate: "30/1"), 7_000)
+        XCTAssertEqual(hdrBitRate(width: 3840, height: 2160, frameRate: "30000/1001"), 20_000)
+        XCTAssertEqual(hdrBitRate(width: 2560, height: 1440, frameRate: "25/1"), 9_700)
+        // 2.39:1 1080p sits between the 720p and 1080p rungs.
+        XCTAssertEqual(hdrBitRate(width: 1920, height: 800, frameRate: "30/1"), 5_637)
+        // Tiny frames scale down but keep a floor.
+        XCTAssertEqual(hdrBitRate(width: 320, height: 180, frameRate: "30/1"), 500)
+        // AirPlay scales 8K to 2160p; local playback keeps 8K.
+        XCTAssertEqual(hdrBitRate(width: 7680, height: 4320, frameRate: "30/1"), 20_000)
+        XCTAssertEqual(hdrBitRate(width: 7680, height: 4320, frameRate: "30/1", intent: .local), 80_000)
+        // Missing size or rate must not lower quality.
+        XCTAssertEqual(hdrBitRate(width: nil, height: nil, frameRate: nil), 20_000)
+    }
+
+    func testHDRBitRateAdjustsForFrameRateAndSourceRate() {
+        XCTAssertEqual(hdrBitRate(width: 3840, height: 2160, frameRate: "24000/1001"), 16_000)
+        XCTAssertEqual(hdrBitRate(width: 3840, height: 2160, frameRate: "60/1"), 30_000)
+        XCTAssertEqual(hdrBitRate(width: 3840, height: 2160, frameRate: "60000/1001"), 29_980)
+        // AirPlay halves 120 fps, so the rate follows the 60 fps output.
+        XCTAssertEqual(hdrBitRate(width: 1920, height: 1080, frameRate: "120/1"), 10_500)
+        // A low-rate source caps the encode at 125% of its own rate.
+        XCTAssertEqual(hdrBitRate(width: 1920, height: 1080, frameRate: "30/1", source: 4_000_000), 5_000)
+        XCTAssertEqual(hdrBitRate(width: 1920, height: 1080, frameRate: "30/1", source: 40_000_000), 7_000)
+    }
+
+    func testHDRBitRateUsesProbedSourceRates() throws {
+        // Verbatim FFprobe 9.0.2 fields from a generated 4:2:2 HLG libx265 clip.
+        let data = #"{"streams":[{"index":0,"codec_name":"hevc","profile":"Rext","codec_type":"video","width":1920,"height":1080,"pix_fmt":"yuv422p10le","color_transfer":"arib-std-b67","color_primaries":"bt2020","avg_frame_rate":"50/1","bit_rate":"6342024"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"1.000000","bit_rate":"6455536"}}"#.data(using: .utf8)!
+        let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))
+        XCTAssertEqual(mapped.videoBitRate, 6_342_024)
+        XCTAssertEqual(mapped.containerBitRate, 6_455_536)
+        // 50 fps raises 7,000 to 9,333; the 6.34 Mbit/s source caps it at 7,928.
+        XCTAssertEqual(HDRBitRate.kilobits(for: mapped, intent: .airPlay), 7_928)
+        let step = TranscodePlanner.plan(info: mapped, intent: .airPlay).steps[0]
+        let rate = try XCTUnwrap(step.videoArguments.firstIndex(of: "-b:v"))
+        XCTAssertEqual(step.videoArguments[rate + 1], "7928k")
+
+        // Matroska streams have no bit_rate; mkvmerge writes a BPS tag, and
+        // FFmpeg-muxed files only have the container rate.
+        let mkv = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"vp9","tags":{"BPS-eng":"3000000"}}],"format":{"format_name":"matroska,webm","bit_rate":"3200000"}}"#.data(using: .utf8)!
+        XCTAssertEqual(FFprobeService.mediaInfo(from: try FFprobeService.parse(mkv)).estimatedVideoBitRate, 3_000_000)
+        let bare = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"vp9"}],"format":{"format_name":"matroska,webm","bit_rate":"3200000"}}"#.data(using: .utf8)!
+        XCTAssertEqual(FFprobeService.mediaInfo(from: try FFprobeService.parse(bare)).estimatedVideoBitRate, 3_200_000)
+    }
+
     func testNonHEVCHDRIsEncodedAsTaggedHEVCMain10() {
         for intent in PlaybackIntent.allCases {
             for (codec, transfer) in [("vp9", "smpte2084"), ("av1", "arib-std-b67")] {
