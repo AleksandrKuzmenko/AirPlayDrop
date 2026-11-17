@@ -87,6 +87,9 @@ struct FFprobeStream: Codable, Equatable, Sendable {
     let side_data_list: [FFprobeSideData]?
     var color_primaries: String? = nil
     var color_space: String? = nil
+    var width: Int? = nil
+    var height: Int? = nil
+    var avg_frame_rate: String? = nil
 
     var isForced: Bool { disposition?["forced"] == 1 }
 }
@@ -242,7 +245,9 @@ enum FFprobeService {
             dolbyVisionCompatibilityID: dolbyVision?.dv_bl_signal_compatibility_id,
             rotation: sideData.compactMap(\.rotation).first,
             colorPrimaries: video?.color_primaries,
-            colorSpace: video?.color_space)
+            colorSpace: video?.color_space,
+            width: video?.width, height: video?.height,
+            averageFrameRate: video?.avg_frame_rate)
     }
 
     static func preferredAudio(from streams: [FFprobeStream], preferredLanguage: String? = Locale.current.language.languageCode?.identifier) -> FFprobeStream? {

@@ -24,8 +24,34 @@ final class MediaItem: Identifiable, @unchecked Sendable {
     /// HDR/DV needs an explicitly AirPlay-safe conversion. A generic remux may
     /// produce an MP4 while retaining Dolby Vision RPU data, an `hev1` sample
     /// entry, or other stream metadata that Apple TV cannot consume.
+    ///
+    /// Video the Mac plays but the Apple TV cannot decode, such as 10-bit or
+    /// 4:2:2 H.264, HEVC range extensions, AV1, or anything above 2160p60,
+    /// also needs a conversion. AVFoundation reports such HEVC sources as
+    /// AirPlay-prepared, so only a copy made by an AirPlay plan skips the check.
     var needsAirPlayTranscode: Bool {
-        !isAirPlayPrepared && !effectiveFormatFlags.isEmpty
+        if hasAirPlayPreparedCopy { return false }
+        if !playedVideoIsAppleTVCompatible { return true }
+        return !isAirPlayPrepared && !effectiveFormatFlags.isEmpty
+    }
+
+    /// Apple TV compatibility of a prepared copy's video, probed after
+    /// preparation. It applies only while that copy is the one being played.
+    var preparedCopyCompatibility: (url: URL, isCompatible: Bool)?
+
+    /// Judges the file AVPlayer will stream: a probed prepared copy when there
+    /// is one (a local H.264 encode of a VP9 source is already compatible),
+    /// otherwise the source.
+    var playedVideoIsAppleTVCompatible: Bool {
+        if let transcodedURL, let checked = preparedCopyCompatibility, checked.url == transcodedURL {
+            return checked.isCompatible
+        }
+        guard let mediaInfo else { return true }
+        return AppleTVVideoCompatibility.isCompatible(mediaInfo)
+    }
+
+    var hasAirPlayPreparedCopy: Bool {
+        isAirPlayPrepared && playbackIntent == .airPlay && transcodedURL != nil
     }
 
     /// HDR/DV markers from AVFoundation combined with those from FFprobe.

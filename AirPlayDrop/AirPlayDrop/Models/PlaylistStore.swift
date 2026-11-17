@@ -238,6 +238,9 @@ final class PlaylistStore {
                     if validation.isValid { cachedURL = candidate; break }
                 }
                 if let cachedURL {
+                    let probed = try? await FFprobeService.probe(cachedURL, using: installation)
+                    guard self.isCurrent(token, for: item), !Task.isCancelled else { return }
+                    item.preparedCopyCompatibility = probed.map { (cachedURL, AppleTVVideoCompatibility.isCompatible($0)) }
                     item.transcodedURL = cachedURL
                     item.isAirPlayPrepared = intent == .airPlay
                     item.preparationReason = "Reused a validated prepared copy."
@@ -258,6 +261,7 @@ final class PlaylistStore {
                         }
                     guard self.isCurrent(token, for: item), !Task.isCancelled else { return }
                     item.transcodedURL = artifact.url == item.fileURL ? nil : artifact.url
+                    item.preparedCopyCompatibility = artifact.isAppleTVCompatible.map { (artifact.url, $0) }
                     item.isAirPlayPrepared = artifact.isAirPlayPrepared
                     item.preparationReason = artifact.reason
                     item.state = .ready

@@ -12,8 +12,10 @@ final class AirPlayDropTests: XCTestCase {
             tracks.append(MediaTrack(id: 2, kind: .audio, codec: audio, language: "eng", title: "English",
                 channels: 6, isDefault: true, isTextSubtitle: false))
         }
-        return MediaInfo(formatName: format, duration: 120, videoCodec: video, videoProfile: "Main 10",
-            pixelFormat: "yuv420p10le", colorTransfer: hdr ? "smpte2084" : nil,
+        let h264 = video == "h264"
+        return MediaInfo(formatName: format, duration: 120, videoCodec: video,
+            videoProfile: h264 ? "High" : "Main 10", pixelFormat: h264 ? "yuv420p" : "yuv420p10le",
+            colorTransfer: hdr ? "smpte2084" : nil,
             isDolbyVision: dolbyVision, tracks: tracks)
     }
 
@@ -227,6 +229,151 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertEqual(steps.map(\.strategy), [.hdrRemux, .hardwareEncode, .hardwareEncode])
         XCTAssertEqual(steps[0].audioArguments, ["-c:a", "copy"])
         XCTAssertEqual(steps[2].audioArguments.first(where: { $0 == "eac3" }), "eac3")
+    }
+
+    private func video(_ codec: String, profile: String?, pixelFormat: String?, width: Int? = 1920,
+                       height: Int? = 1080, frameRate: String? = "24000/1001", hdr: Bool = false) -> MediaInfo {
+        MediaInfo(formatName: "mov,mp4,m4a,3gp,3g2,mj2", duration: 120, videoCodec: codec,
+            videoProfile: profile, pixelFormat: pixelFormat, colorTransfer: hdr ? "arib-std-b67" : nil,
+            isDolbyVision: false, tracks: [audioTrack("aac", channels: 2)],
+            width: width, height: height, averageFrameRate: frameRate)
+    }
+
+    func testProbeMapsVideoDimensionsAndFrameRate() throws {
+        // Verbatim FFprobe 9.0.2 fields from a generated 10-bit libx264 clip.
+        let data = #"{"streams":[{"index":0,"codec_name":"h264","profile":"High 10","codec_type":"video","width":320,"height":180,"pix_fmt":"yuv420p10le","level":12,"r_frame_rate":"24/1","avg_frame_rate":"24/1"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"1.000000"}}"#.data(using: .utf8)!
+        let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))
+        XCTAssertEqual(mapped.width, 320)
+        XCTAssertEqual(mapped.height, 180)
+        XCTAssertEqual(mapped.frameRate, 24)
+        XCTAssertEqual(AppleTVVideoCompatibility.issues(for: mapped),
+                       [.profile("High 10"), .pixelFormat("yuv420p10le")])
+        XCTAssertNil(video("h264", profile: nil, pixelFormat: nil, frameRate: "0/0").frameRate)
+    }
+
+    func testAppleTVRulesAcceptStreamableVideo() {
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("h264", profile: "High", pixelFormat: "yuv420p")))
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("h264", profile: "Constrained Baseline",
+            pixelFormat: "yuvj420p", width: 1080, height: 1920, frameRate: "30/1")))
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("hevc", profile: "Main 10",
+            pixelFormat: "yuv420p10le", width: 3840, height: 2160, frameRate: "60000/1001", hdr: true)))
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("hevc", profile: "Main",
+            pixelFormat: "yuv420p", width: 4096, height: 2160, frameRate: "60/1")))
+        // Variable-frame-rate 60 fps recordings often probe slightly above 60.
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("h264", profile: "High",
+            pixelFormat: "yuv420p", frameRate: "301/5")))
+        XCTAssertFalse(AppleTVVideoCompatibility.isCompatible(video("h264", profile: "High",
+            pixelFormat: "yuv420p", frameRate: "64/1")))
+        // Unrecognised profile names defer to the pixel format.
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("h264", profile: "Progressive High",
+            pixelFormat: "yuv420p")))
+        // Missing probe fields must not force a lossy re-encode.
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("hevc", profile: nil, pixelFormat: nil,
+            width: nil, height: nil, frameRate: nil)))
+        XCTAssertTrue(AppleTVVideoCompatibility.issues(for: info(video: "h264", audio: nil)).isEmpty)
+    }
+
+    func testAppleTVRulesRejectVideoTheMacPlaysButAppleTVDoesNot() {
+        typealias Rules = AppleTVVideoCompatibility
+        XCTAssertEqual(Rules.issues(for: video("h264", profile: "High 4:2:2", pixelFormat: "yuv422p")),
+                       [.profile("High 4:2:2"), .pixelFormat("yuv422p")])
+        XCTAssertEqual(Rules.issues(for: video("h264", profile: "High 4:4:4 Predictive", pixelFormat: "yuv444p")).count, 2)
+        XCTAssertEqual(Rules.issues(for: video("hevc", profile: "Rext", pixelFormat: "yuv422p10le")),
+                       [.profile("Rext"), .pixelFormat("yuv422p10le")])
+        XCTAssertEqual(Rules.issues(for: video("av1", profile: "Main", pixelFormat: "yuv420p")), [.codec("av1")])
+        XCTAssertEqual(Rules.issues(for: video("hevc", profile: "Main", pixelFormat: "yuv420p",
+            width: 7680, height: 4320)), [.resolution(width: 7680, height: 4320)])
+        XCTAssertEqual(Rules.issues(for: video("h264", profile: "High", pixelFormat: "yuv420p",
+            frameRate: "120/1")), [.frameRate(120)])
+        XCTAssertEqual(Rules.reason(for: [.profile("High 10"), .frameRate(120)]),
+                       "Apple TV cannot play the High 10 profile, 120 fps streamed over AirPlay.")
+    }
+
+    func testConformingArgumentsScaleAndHalveFrameRate() {
+        let eightK = video("hevc", profile: "Main", pixelFormat: "yuv420p", width: 7680, height: 4320,
+                           frameRate: "120000/1001")
+        let limits = AppleTVVideoCompatibility.conformingArguments(for: eightK)
+        XCTAssertEqual(limits.filters, ["scale=w=4096:h=2160:force_original_aspect_ratio=decrease:force_divisible_by=2"])
+        XCTAssertEqual(limits.output, ["-r", "120000/2002"])
+        let portrait = video("h264", profile: "High", pixelFormat: "yuv420p", width: 4320, height: 7680,
+                             frameRate: "240/1")
+        XCTAssertEqual(AppleTVVideoCompatibility.conformingArguments(for: portrait).filters,
+                       ["scale=w=2160:h=4096:force_original_aspect_ratio=decrease:force_divisible_by=2"])
+        XCTAssertEqual(AppleTVVideoCompatibility.conformingArguments(for: portrait).output, ["-r", "240/4"])
+        let fine = AppleTVVideoCompatibility.conformingArguments(for: video("h264", profile: "High", pixelFormat: "yuv420p"))
+        XCTAssertTrue(fine.filters.isEmpty)
+        XCTAssertTrue(fine.output.isEmpty)
+    }
+
+    func testAirPlayPlanNeverCopiesVideoAppleTVCannotDecode() {
+        let sources = [
+            video("h264", profile: "High 10", pixelFormat: "yuv420p10le"),
+            video("h264", profile: "High", pixelFormat: "yuv420p", frameRate: "120/1"),
+            video("hevc", profile: "Rext", pixelFormat: "yuv422p10le"),
+            video("hevc", profile: "Rext", pixelFormat: "yuv422p10le", hdr: true),
+            video("hevc", profile: "Main 10", pixelFormat: "yuv420p10le", width: 7680, height: 4320, hdr: true),
+        ]
+        for source in sources {
+            let plan = TranscodePlanner.plan(info: source, intent: .airPlay, selectedAudioID: 2)
+            XCTAssertFalse(plan.steps.isEmpty)
+            XCTAssertTrue(plan.reason.hasPrefix("Apple TV cannot play"), plan.reason)
+            for step in plan.steps {
+                XCTAssertFalse(step.videoArguments.contains("copy"), "\(step.strategy) copies video: \(step.videoArguments)")
+                XCTAssertEqual(step.strategy, .hardwareEncode)
+            }
+        }
+        let tenBit = TranscodePlanner.plan(info: sources[0], intent: .airPlay, selectedAudioID: 2).steps[0]
+        XCTAssertEqual(tenBit.videoArguments, ["-vf", "format=yuv420p", "-c:v", "h264_videotoolbox", "-b:v", "5000k"])
+        XCTAssertEqual(tenBit.audioArguments, ["-c:a", "copy"])
+        let fast = TranscodePlanner.plan(info: sources[1], intent: .airPlay, selectedAudioID: 2).steps[0]
+        XCTAssertEqual(Array(fast.videoArguments.prefix(4)), ["-vf", "format=yuv420p", "-r", "120/2"])
+        let hlg422 = TranscodePlanner.plan(info: sources[3], intent: .airPlay, selectedAudioID: 2).steps[0]
+        XCTAssertTrue(hlg422.videoArguments.contains("hevc_videotoolbox"))
+        XCTAssertEqual(hlg422.requiredTransfer, "arib-std-b67")
+        let eightK = TranscodePlanner.plan(info: sources[4], intent: .airPlay, selectedAudioID: 2).steps[0]
+        XCTAssertEqual(eightK.videoArguments[1],
+            "scale=w=4096:h=2160:force_original_aspect_ratio=decrease:force_divisible_by=2,setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc")
+    }
+
+    func testLocalPlanStillCopiesVideoTheMacPlays() {
+        let tenBit = video("h264", profile: "High 10", pixelFormat: "yuv420p10le")
+        let steps = TranscodePlanner.plan(info: tenBit, intent: .local, selectedAudioID: 2,
+                                          requiresSubtitleMuxing: true).steps
+        XCTAssertEqual(steps.first?.strategy, .remux)
+        XCTAssertEqual(steps.first?.videoArguments, ["-c:v", "copy"])
+        let compatible = video("h264", profile: "High", pixelFormat: "yuv420p")
+        XCTAssertEqual(TranscodePlanner.plan(info: compatible, intent: .airPlay, selectedAudioID: 2).steps.first?.strategy, .remux)
+    }
+
+    func testIncompatibleVideoTriggersAirPlayPreparationUntilAirPlayCopyExists() {
+        // AVFoundation marks any HEVC source with audio as AirPlay-prepared,
+        // including range-extension HEVC the Apple TV cannot decode.
+        let item = MediaItem(fileURL: URL(fileURLWithPath: "/tmp/Camera.mov"))
+        item.mediaInfo = video("hevc", profile: "Rext", pixelFormat: "yuv422p10le")
+        item.isAirPlayPrepared = true
+        XCTAssertTrue(item.needsAirPlayTranscode)
+
+        // An unprobed local copy is judged by its source.
+        let local = URL(fileURLWithPath: "/tmp/Camera_local.mp4")
+        item.transcodedURL = local
+        item.playbackIntent = .local
+        XCTAssertTrue(item.needsAirPlayTranscode)
+        // A local H.264 encode that probed compatible streams as it is.
+        item.preparedCopyCompatibility = (local, true)
+        XCTAssertFalse(item.needsAirPlayTranscode)
+        item.preparedCopyCompatibility = (local, false)
+        XCTAssertTrue(item.needsAirPlayTranscode)
+        // A probe result for a different copy does not apply.
+        item.preparedCopyCompatibility = (URL(fileURLWithPath: "/tmp/Other.mp4"), true)
+        XCTAssertTrue(item.needsAirPlayTranscode)
+
+        item.transcodedURL = URL(fileURLWithPath: "/tmp/Camera_airplay.mp4")
+        item.playbackIntent = .airPlay
+        XCTAssertFalse(item.needsAirPlayTranscode)
+
+        let compatible = MediaItem(fileURL: URL(fileURLWithPath: "/tmp/Clip.mp4"))
+        compatible.mediaInfo = video("h264", profile: "High", pixelFormat: "yuv420p")
+        XCTAssertFalse(compatible.needsAirPlayTranscode)
     }
 
     func testNonHEVCHDRIsEncodedAsTaggedHEVCMain10() {
@@ -548,6 +695,13 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertEqual(manifest.selectedAudioID, 5)
         XCTAssertTrue(manifest.requiresHVC1)
         XCTAssertEqual(manifest.playbackIntent, .local)
+        XCTAssertNil(manifest.appleTVRulesVersion)
+
+        try MediaArtifactValidator.writeManifest(source: source, artifact: output, sourceHadAudio: true,
+            selectedAudioID: 5, expectedDuration: 10, requiresHVC1: true, playbackIntent: .airPlay)
+        let airPlay = try JSONDecoder().decode(MediaArtifactManifest.self,
+            from: Data(contentsOf: MediaArtifactValidator.manifestURL(for: output)))
+        XCTAssertEqual(airPlay.appleTVRulesVersion, AppleTVVideoCompatibility.rulesVersion)
     }
 
     func testManifestWriteFailsWhenSourceMissing() throws {

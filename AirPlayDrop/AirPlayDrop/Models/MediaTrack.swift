@@ -71,6 +71,17 @@ struct MediaInfo: Codable, Equatable, Sendable {
     var colorPrimaries: String? = nil
     /// FFmpeg colour matrix name, such as `bt2020nc`.
     var colorSpace: String? = nil
+    var width: Int? = nil
+    var height: Int? = nil
+    /// FFprobe `avg_frame_rate`, a rational such as `24000/1001`; `0/0` when unknown.
+    var averageFrameRate: String? = nil
+
+    /// Frames per second, or nil when FFprobe could not determine the rate.
+    var frameRate: Double? {
+        guard let (numerator, denominator) = AppleTVVideoCompatibility.rational(averageFrameRate),
+              numerator > 0 else { return nil }
+        return Double(numerator) / Double(denominator)
+    }
 
     /// The PQ or HLG transfer function when the video signals HDR10 or HLG.
     var hdrTransfer: String? {
@@ -312,10 +323,13 @@ enum HDRVideoArguments {
     /// `-color_trc`-style output options, so the tags are set on the frames
     /// with `setparams`. Missing source primaries or matrix default to
     /// BT.2020, which HDR10 and HLG both specify.
-    static func hevcMain10(for info: MediaInfo) -> [String] {
-        let filter = colorFilter(for: info).map { ["-vf", $0] } ?? []
-        return filter + ["-c:v", "hevc_videotoolbox", "-profile:v", "main10", "-pix_fmt", "p010le",
-                         "-b:v", "12000k", "-tag:v", "hvc1"]
+    static func hevcMain10(for info: MediaInfo, intent: PlaybackIntent = .local) -> [String] {
+        let limits = intent == .airPlay ? AppleTVVideoCompatibility.conformingArguments(for: info)
+                                        : (filters: [], output: [])
+        let filters = limits.filters + [colorFilter(for: info)].compactMap { $0 }
+        return (filters.isEmpty ? [] : ["-vf", filters.joined(separator: ",")]) + limits.output
+            + ["-c:v", "hevc_videotoolbox", "-profile:v", "main10", "-pix_fmt", "p010le",
+               "-b:v", "12000k", "-tag:v", "hvc1"]
     }
 
     static func colorFilter(for info: MediaInfo) -> String? {
@@ -328,6 +342,118 @@ enum HDRVideoArguments {
     private static func known(_ value: String?) -> String? {
         guard let value, !["unknown", "unspecified", "reserved"].contains(value) else { return nil }
         return value
+    }
+}
+
+/// What an Apple TV can decode from a stream-copied AirPlay MP4.
+///
+/// Apple's HLS authoring specification for Apple devices limits H.264 to
+/// High Profile or lower and HEVC to Main 10 Profile or lower, and says
+/// frame rates above 60 fps shall not be used. Those profiles mean 8-bit
+/// 4:2:0 H.264 and 8- or 10-bit 4:2:0 HEVC, so High 10, 4:2:2, 4:4:4, and
+/// HEVC range-extension streams are converted even when the Mac plays them.
+/// The Apple TV 4K specifications (apple.com/apple-tv-4k/specs) give the
+/// "up to 2160p, 60 fps" ceiling.
+///
+/// The rules are deliberately conservative where they are strict and lenient
+/// where probes are unreliable. AV1 and VP9 are always converted for AirPlay:
+/// the Apple TV 4K specifications list them, but not every Apple TV decodes
+/// them and AirPlay of them is unverified. Levels are not checked because
+/// encoders often misreport them, and a false rejection costs a lossy
+/// re-encode. Unknown fields and unrecognised profile names count as compatible
+/// for the same reason; the pixel format still catches bit depth and chroma.
+enum AppleTVVideoCompatibility {
+    /// Bump when the rules change so AirPlay copies prepared under older rules are re-prepared.
+    static let rulesVersion = 1
+    static let maxLongSide = 4096
+    static let maxShortSide = 2160
+    static let maxFrameRate = 60.0
+    /// Variable-frame-rate phone and screen recordings nominally at 60 fps
+    /// often probe slightly above it.
+    static let frameRateLimit = maxFrameRate * 1.05
+
+    /// FFprobe profile names above H.264 High and HEVC Main 10.
+    static let unsupportedProfiles: [String: Set<String>] = [
+        "h264": ["High 10", "High 10 Intra", "High 4:2:2", "High 4:2:2 Intra", "High 4:4:4",
+                 "High 4:4:4 Predictive", "High 4:4:4 Intra", "CAVLC 4:4:4", "CAVLC 4:4:4 Intra"],
+        "hevc": ["Rext", "SCC"],
+    ]
+    static let pixelFormats: [String: Set<String>] = [
+        "h264": ["yuv420p", "yuvj420p"],
+        "hevc": ["yuv420p", "yuvj420p", "yuv420p10le"],
+    ]
+
+    enum Issue: Equatable, Sendable {
+        case codec(String)
+        case profile(String)
+        case pixelFormat(String)
+        case resolution(width: Int, height: Int)
+        case frameRate(Double)
+
+        var description: String {
+            switch self {
+            case .codec(let codec): return "\(codec.uppercased()) video"
+            case .profile(let profile): return "the \(profile) profile"
+            case .pixelFormat(let format): return "\(format) pixels"
+            case .resolution(let width, let height): return "\(width)×\(height) resolution"
+            case .frameRate(let rate): return "\(String(format: "%.4g", rate)) fps"
+            }
+        }
+    }
+
+    static func issues(for info: MediaInfo) -> [Issue] {
+        guard let codec = info.videoCodec?.lowercased() else { return [] }
+        guard let blockedProfiles = unsupportedProfiles[codec], let allowedFormats = pixelFormats[codec] else {
+            return [.codec(codec)]
+        }
+        var issues: [Issue] = []
+        if let profile = info.videoProfile, blockedProfiles.contains(profile) {
+            issues.append(.profile(profile))
+        }
+        if let format = info.pixelFormat, !allowedFormats.contains(format) {
+            issues.append(.pixelFormat(format))
+        }
+        if exceedsResolution(info), let width = info.width, let height = info.height {
+            issues.append(.resolution(width: width, height: height))
+        }
+        if let rate = info.frameRate, rate > frameRateLimit {
+            issues.append(.frameRate(rate))
+        }
+        return issues
+    }
+
+    static func isCompatible(_ info: MediaInfo) -> Bool { issues(for: info).isEmpty }
+
+    static func reason(for issues: [Issue]) -> String {
+        "Apple TV cannot play " + issues.map(\.description).joined(separator: ", ") + " streamed over AirPlay."
+    }
+
+    /// Filters and output options that bring an encode within Apple TV limits.
+    static func conformingArguments(for info: MediaInfo) -> (filters: [String], output: [String]) {
+        var filters: [String] = []
+        if exceedsResolution(info), let width = info.width, let height = info.height {
+            let (w, h) = width >= height ? (maxLongSide, maxShortSide) : (maxShortSide, maxLongSide)
+            filters.append("scale=w=\(w):h=\(h):force_original_aspect_ratio=decrease:force_divisible_by=2")
+        }
+        var output: [String] = []
+        if let (numerator, denominator) = rational(info.averageFrameRate), let rate = info.frameRate,
+           rate > frameRateLimit {
+            // Divide by a whole number so 120 becomes 60 and 119.88 becomes 59.94.
+            let divisor = Int((rate / frameRateLimit).rounded(.up))
+            output = ["-r", "\(numerator)/\(denominator * divisor)"]
+        }
+        return (filters, output)
+    }
+
+    static func rational(_ value: String?) -> (Int, Int)? {
+        guard let parts = value?.split(separator: "/"), parts.count == 2,
+              let numerator = Int(parts[0]), let denominator = Int(parts[1]), denominator > 0 else { return nil }
+        return (numerator, denominator)
+    }
+
+    private static func exceedsResolution(_ info: MediaInfo) -> Bool {
+        guard let width = info.width, let height = info.height else { return false }
+        return max(width, height) > maxLongSide || min(width, height) > maxShortSide
     }
 }
 
@@ -344,6 +470,14 @@ enum TranscodePlanner {
                      requiresSubtitleMuxing: Bool = false,
                      surroundEncoder: SurroundAudioEncoder = .eac3) -> ConversionPlan {
         let video = info.videoCodec?.lowercased()
+        let appleTVIssues = intent == .airPlay ? AppleTVVideoCompatibility.issues(for: info) : []
+        // Local playback copies any H.264/HEVC. AirPlay copies only video the Apple TV decodes.
+        let canCopyVideo = ["h264", "hevc"].contains(video) && appleTVIssues.isEmpty
+        let conforming = intent == .airPlay ? AppleTVVideoCompatibility.conformingArguments(for: info)
+                                            : (filters: [], output: [])
+        let h264Filters = conforming.filters + ["format=yuv420p"]
+        let h264Encode = ["-vf", h264Filters.joined(separator: ",")] + conforming.output
+            + ["-c:v", "h264_videotoolbox", "-b:v", "5000k"]
         let audioTrack = info.audioTracks.first(where: { $0.id == selectedAudioID }) ?? info.audioTracks.first
         let audio = audioTrack?.codec.lowercased()
         let preferredAudio = AudioArguments.preferred(audioTrack, mode: audioProcessingMode,
@@ -371,30 +505,34 @@ enum TranscodePlanner {
         }
 
         if intent == .airPlay, video == "hevc", info.isHDR {
-            return ConversionPlan(intent: intent, steps: [
+            let remux = !canCopyVideo ? [] : [
                 ConversionStep(strategy: .hdrRemux,
                     reason: "Preserve the HEVC HDR base layer, remove Dolby Vision RPU data, and create an hvc1 MP4.",
                     videoArguments: ["-c:v", "copy", "-bsf:v", "filter_units=remove_types=62", "-tag:v", "hvc1"],
                     audioArguments: preferredAudio, requiresHVC1: true,
                     audioProcessingMode: audioProcessingMode, requiredTransfer: info.hdrTransfer)
-            ] + encodeSteps(strategy: .hardwareEncode,
+            ]
+            let reason = !appleTVIssues.isEmpty ? AppleTVVideoCompatibility.reason(for: appleTVIssues)
+                : info.isDolbyVision ? "Dolby Vision needs an Apple TV compatible HDR10 fallback."
+                : "HDR HEVC needs an AirPlay-safe MP4 sample entry."
+            return ConversionPlan(intent: intent, steps: remux + encodeSteps(strategy: .hardwareEncode,
                     reason: "Re-encode HDR as HEVC Main 10 when the lossless HDR remux is rejected.",
-                    videoArguments: HDRVideoArguments.hevcMain10(for: info),
-                    requiresHVC1: true, requiredTransfer: info.hdrTransfer), reason: info.isDolbyVision ? "Dolby Vision needs an Apple TV compatible HDR10 fallback." : "HDR HEVC needs an AirPlay-safe MP4 sample entry.")
+                    videoArguments: HDRVideoArguments.hevcMain10(for: info, intent: intent),
+                    requiresHVC1: true, requiredTransfer: info.hdrTransfer), reason: reason)
         }
 
         // AV1, VP9, and other HDR sources that cannot be stream-copied. The
         // generic H.264 encode would produce 8-bit video still tagged PQ/HLG,
         // so HDR is encoded as HEVC Main 10 instead, with no H.264 fallback.
-        if let transfer = info.hdrTransfer, !["h264", "hevc"].contains(video) {
+        if let transfer = info.hdrTransfer, !canCopyVideo {
             return ConversionPlan(intent: intent, steps: encodeSteps(strategy: .hardwareEncode,
                     reason: "Encode HDR video as HEVC Main 10, keeping its HDR signalling.",
-                    videoArguments: HDRVideoArguments.hevcMain10(for: info),
+                    videoArguments: HDRVideoArguments.hevcMain10(for: info, intent: intent),
                     requiresHVC1: true, requiredTransfer: transfer), reason: "HDR \((video ?? "video").uppercased()) needs a 10-bit HEVC copy to keep HDR on Apple TV.")
         }
 
         var steps: [ConversionStep] = []
-        if ["h264", "hevc"].contains(video) {
+        if canCopyVideo {
             if AudioArguments.canCopy(audioTrack, mode: audioProcessingMode, syncAdjustment: syncAdjustment) {
                 steps.append(ConversionStep(strategy: .remux, reason: "Repackage compatible streams without quality loss.",
                     videoArguments: ["-c:v", "copy"] + (video == "hevc" ? ["-tag:v", "hvc1"] : []),
@@ -407,7 +545,7 @@ enum TranscodePlanner {
                 audioArguments: encodedAudio, requiresHVC1: video == "hevc",
                 audioProcessingMode: audioProcessingMode))
         }
-        if audioProcessingMode == .lateNight && steps.isEmpty {
+        if audioProcessingMode == .lateNight && steps.isEmpty && intent == .local {
             steps.append(ConversionStep(strategy: .audioTranscode,
                 reason: "Re-encode audio with the optional late-night dialogue-focused preset.",
                 videoArguments: ["-c:v", "copy"],
@@ -415,8 +553,10 @@ enum TranscodePlanner {
                 requiresHVC1: video == "hevc", audioProcessingMode: .lateNight))
         }
         steps += encodeSteps(strategy: .hardwareEncode, reason: "Use Apple hardware encoding for broad playback compatibility.",
-            videoArguments: ["-c:v", "h264_videotoolbox", "-b:v", "5000k"], requiresHVC1: false,
+            videoArguments: h264Encode, requiresHVC1: false,
             requiredTransfer: nil)
-        return ConversionPlan(intent: intent, steps: steps, reason: "Prepare a compatible MP4 using the least destructive available strategy.")
+        return ConversionPlan(intent: intent, steps: steps, reason: appleTVIssues.isEmpty
+            ? "Prepare a compatible MP4 using the least destructive available strategy."
+            : AppleTVVideoCompatibility.reason(for: appleTVIssues))
     }
 }

@@ -13,6 +13,7 @@ The project is currently a **0.1.x alpha**. The release process produces an arm6
 - Preferred audio and subtitle languages for newly imported files.
 - Automatic discovery and manual attachment of external `.srt`, `.vtt`, `.ass`, and `.ssa` subtitles.
 - Per-file audio and subtitle synchronization adjustment from -10 to +10 seconds.
+- Apple TV video checks: video the Mac plays but Apple TV cannot decode, such as 10-bit or 4:2:2 H.264, 4:2:2 HEVC, AV1, or video above 2160p or 60 fps, is converted before AirPlay playback instead of streamed as-is.
 - Surround audio preserved for Apple TV: AAC, AC3, and E-AC3 tracks are copied unchanged, and other multichannel audio is converted to E-AC3 up to 5.1.
 - Optional Late Night audio processing for quieter peaks and clearer dialogue.
 - Resume playback for unfinished videos and timeline thumbnail previews while scrubbing.
@@ -93,7 +94,7 @@ Alternatively, use **FFmpeg Settings** to select a trusted directory containing 
 
 ### Audio plays but video is black on Apple TV
 
-Stop playback and use **Prepare for → Apple TV / AirPlay**. Dolby Vision and some HEVC-in-MKV files need an AirPlay-safe MP4 sample entry or an HDR10-compatible fallback.
+Stop playback and use **Prepare for → Apple TV / AirPlay**. Dolby Vision and some HEVC-in-MKV files need an AirPlay-safe MP4 sample entry or an HDR10-compatible fallback. AirPlayDrop also converts camera and editing formats that the Mac plays but Apple TV cannot decode, such as 10-bit or 4:2:2 H.264 and 4:2:2 HEVC, when playback starts on an AirPlay route.
 
 ### The wrong audio or subtitle track was selected
 

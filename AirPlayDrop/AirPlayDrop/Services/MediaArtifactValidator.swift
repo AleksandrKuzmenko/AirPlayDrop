@@ -26,6 +26,8 @@ struct MediaArtifactManifest: Codable, Sendable {
     let playbackIntent: PlaybackIntent
     /// Absent in manifests written before transfer validation existed.
     let requiredTransfer: String?
+    /// Apple TV video rules an AirPlay copy was planned under; absent before they existed.
+    let appleTVRulesVersion: Int?
 }
 
 enum MediaArtifactError: LocalizedError {
@@ -69,7 +71,8 @@ enum MediaArtifactValidator {
             selectedSubtitle: selectedSubtitle, syncAdjustment: syncAdjustment,
             audioProcessingMode: audioProcessingMode,
             audioProcessingPresetVersion: audioProcessingPresetVersion,
-            playbackIntent: playbackIntent, requiredTransfer: requiredTransfer)
+            playbackIntent: playbackIntent, requiredTransfer: requiredTransfer,
+            appleTVRulesVersion: playbackIntent == .airPlay ? AppleTVVideoCompatibility.rulesVersion : nil)
         let data = try JSONEncoder().encode(manifest)
         try data.write(to: manifestURL(for: artifact), options: .atomic)
     }
@@ -93,6 +96,7 @@ enum MediaArtifactValidator {
               manifest.audioProcessingMode == expectedAudioProcessingMode,
               manifest.audioProcessingPresetVersion == AudioProcessingPreset.version,
               manifest.playbackIntent == expectedIntent,
+              expectedIntent != .airPlay || manifest.appleTVRulesVersion == AppleTVVideoCompatibility.rulesVersion,
               (manifest.selectedSubtitle.externalDescriptor == nil || manifest.selectedSubtitle.externalDescriptor?.isCurrent == true),
               let outputValues = try? artifact.resourceValues(forKeys: [.fileSizeKey]),
               Int64(outputValues.fileSize ?? -1) == manifest.outputSize else {

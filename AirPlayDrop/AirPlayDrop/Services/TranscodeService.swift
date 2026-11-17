@@ -38,6 +38,8 @@ struct PreparedArtifact: Sendable {
     let strategy: ConversionStrategy
     let reason: String
     let isAirPlayPrepared: Bool
+    /// Whether the copy's probed video is within Apple TV limits; nil when not probed.
+    var isAppleTVCompatible: Bool? = nil
 }
 
 private final class RunningProcess: @unchecked Sendable {
@@ -298,6 +300,19 @@ enum TranscodeService {
                 guard validation.isValid else {
                     throw TranscodeError.invalidOutput(validation.reason ?? "Unknown validation error")
                 }
+                // AirPlay copies must probe as Apple TV compatible. Local copies
+                // record the result so a compatible one is not converted again.
+                var outputIssues: [AppleTVVideoCompatibility.Issue]?
+                if intent == .airPlay {
+                    let output = try await FFprobeService.probe(reservation.temporary, using: installation)
+                    let issues = AppleTVVideoCompatibility.issues(for: output)
+                    guard issues.isEmpty else {
+                        throw TranscodeError.invalidOutput(AppleTVVideoCompatibility.reason(for: issues))
+                    }
+                    outputIssues = issues
+                } else if let output = try? await FFprobeService.probe(reservation.temporary, using: installation) {
+                    outputIssues = AppleTVVideoCompatibility.issues(for: output)
+                }
                 try FileManager.default.moveItem(at: reservation.temporary, to: reservation.destination)
                 do {
                     try MediaArtifactValidator.writeManifest(source: input, artifact: reservation.destination,
@@ -312,7 +327,8 @@ enum TranscodeService {
                 }
                 progress(1)
                 return PreparedArtifact(url: reservation.destination, strategy: step.strategy,
-                    reason: step.reason, isAirPlayPrepared: intent == .airPlay)
+                    reason: step.reason, isAirPlayPrepared: intent == .airPlay,
+                    isAppleTVCompatible: outputIssues.map(\.isEmpty))
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
