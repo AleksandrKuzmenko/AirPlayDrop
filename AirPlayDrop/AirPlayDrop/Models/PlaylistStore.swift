@@ -109,9 +109,18 @@ final class PlaylistStore {
     }
 
     func chooseSubtitle(_ selection: SubtitleSelection, for item: MediaItem) {
+        let burnsIn = item.trackSelection.subtitlePolicy == .burnInSelected
         item.trackSelection.subtitle = selection
-        item.trackSelection.subtitlePolicy = selection.isNone ? .omit : .includeSelected
+        item.trackSelection.subtitlePolicy = selection.isNone ? .omit : (burnsIn ? .burnInSelected : .includeSelected)
         invalidatePreparedArtifact(item)
+    }
+
+    /// Burn the selected text subtitle into the video instead of keeping it as
+    /// a separate subtitle track.
+    func setSubtitleBurnIn(_ burnIn: Bool, for item: MediaItem) {
+        guard !item.trackSelection.subtitle.isNone else { return }
+        item.trackSelection.subtitlePolicy = burnIn ? .burnInSelected : .includeSelected
+        invalidatePreparedArtifact(item, reason: "Subtitle burn-in changed; prepare the video again.")
     }
 
     func attachSubtitle(_ url: URL, to item: MediaItem) -> Bool {
@@ -227,7 +236,8 @@ final class PlaylistStore {
                     syncAdjustment: item.syncAdjustment,
                     requiresSubtitleMuxing: item.trackSelection.hasSelectedSubtitle,
                     burnInSubtitle: SubtitleBurnIn.selected(in: info, selection: item.trackSelection,
-                                                            syncAdjustment: item.syncAdjustment),
+                                                            syncAdjustment: item.syncAdjustment,
+                                                            input: item.fileURL),
                     receiver: receiver)
                 item.preparationReason = plan.reason
 

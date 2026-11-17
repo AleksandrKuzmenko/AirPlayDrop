@@ -1101,6 +1101,123 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertNotEqual(sameReceiver.reason, "No current artifact manifest")
     }
 
+    func testFilterEscapingHandlesSpecialCharactersInPaths() {
+        // The same value FFmpeg 9.0.2 accepted for a sidecar at this path in a generated test.
+        XCTAssertEqual(FilterEscaping.value(#"/tmp/odd dir, [x]/it's [a], b; c:d \ e.srt"#),
+                       #"/tmp/odd dir\, \[x\]/it\\\'s \[a\]\, b\; c\\:d \\\\ e.srt"#)
+        XCTAssertEqual(FilterEscaping.value("/Movies/Plain.mkv"), "/Movies/Plain.mkv")
+    }
+
+    func testTextSubtitleBurnInFollowsPolicy() throws {
+        let source = withPGS(video("h264", profile: "High", pixelFormat: "yuv420p"))
+        let input = URL(fileURLWithPath: "/Movies/Film.mkv")
+        let soft = TrackSelection(audioID: 2, subtitleID: 4, subtitlePolicy: .includeSelected)
+        XCTAssertNil(SubtitleBurnIn.selected(in: source, selection: soft, input: input))
+        let burned = TrackSelection(audioID: 2, subtitleID: 4, subtitlePolicy: .burnInSelected)
+        XCTAssertTrue(burned.hasSelectedSubtitle)
+        XCTAssertEqual(SubtitleBurnIn.selected(in: source, selection: burned,
+            syncAdjustment: SyncAdjustment(subtitleMilliseconds: 400), input: input),
+            SubtitleBurnIn(source: .text(path: "/Movies/Film.mkv", subtitleIndex: 1, isASS: false), offsetSeconds: 0.4))
+        // Embedded text needs the source path for libass.
+        XCTAssertNil(SubtitleBurnIn.selected(in: source, selection: burned))
+        // Bitmap tracks burn in whatever the policy.
+        XCTAssertTrue(SubtitleBurnIn.selected(in: source, selection: TrackSelection(audioID: 2, subtitleID: 3,
+            subtitlePolicy: .includeSelected))?.isBitmap == true)
+
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sidecarURL = directory.appendingPathComponent("Film.en.ass")
+        try Data("[Script Info]".utf8).write(to: sidecarURL)
+        let sidecar = try XCTUnwrap(ExternalSubtitleDescriptor.make(url: sidecarURL))
+        let external = TrackSelection(audioID: 2, subtitle: .external(sidecar), subtitlePolicy: .burnInSelected)
+        XCTAssertEqual(SubtitleBurnIn.selected(in: source, selection: external, input: input)?.source,
+                       .text(path: sidecar.standardizedURL.path, subtitleIndex: nil, isASS: true))
+    }
+
+    func testTextBurnInPlansUseSubtitlesFilterChain() {
+        let source = withPGS(video("h264", profile: "High", pixelFormat: "yuv420p"))
+        let text = SubtitleBurnIn(source: .text(path: "/Movies/Film.mkv", subtitleIndex: 1, isASS: false))
+        let plan = TranscodePlanner.plan(info: source, intent: .local, selectedAudioID: 2,
+                                         requiresSubtitleMuxing: true, burnInSubtitle: text)
+        XCTAssertEqual(plan.reason, "The selected subtitle is burned into the video, which needs a full video encode.")
+        XCTAssertTrue(plan.steps.allSatisfy { $0.strategy == .hardwareEncode && $0.burnsInSubtitle })
+        XCTAssertEqual(plan.steps[0].videoArguments.prefix(2),
+                       ["-vf", "subtitles=filename=/Movies/Film.mkv:si=1:wrap_unicode=0,format=yuv420p"])
+        // libass has no offset, so video timestamps are shifted around it.
+        let later = TranscodePlanner.plan(info: source, intent: .airPlay, selectedAudioID: 2,
+            burnInSubtitle: SubtitleBurnIn(source: text.source, offsetSeconds: 0.4)).steps[0]
+        XCTAssertEqual(later.videoArguments[1], "setpts=PTS-0.400/TB,subtitles=filename=/Movies/Film.mkv:si=1:wrap_unicode=0,setpts=PTS+0.400/TB,format=yuv420p")
+        let earlier = TranscodePlanner.plan(info: source, intent: .airPlay, selectedAudioID: 2,
+            burnInSubtitle: SubtitleBurnIn(source: text.source, offsetSeconds: -0.25)).steps[0]
+        XCTAssertEqual(earlier.videoArguments[1], "setpts=PTS+0.250/TB,subtitles=filename=/Movies/Film.mkv:si=1:wrap_unicode=0,setpts=PTS-0.250/TB,format=yuv420p")
+        // HDR output dims plain text to graphics white; ASS keeps its styles.
+        let hdr = MediaInfo(formatName: "matroska,webm", duration: 120, videoCodec: "vp9", videoProfile: nil,
+            pixelFormat: "yuv420p10le", colorTransfer: "smpte2084", isDolbyVision: false,
+            tracks: [audioTrack("aac", channels: 2)], width: 1920, height: 1080, averageFrameRate: "24/1")
+        let dimmed = TranscodePlanner.plan(info: hdr, intent: .airPlay, selectedAudioID: 2, burnInSubtitle: text).steps[0]
+        XCTAssertEqual(dimmed.videoArguments[1], "subtitles=filename=/Movies/Film.mkv:si=1:force_style=PrimaryColour=&H00949494:wrap_unicode=0,setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc")
+        let ass = SubtitleBurnIn(source: .text(path: "/Movies/Film.ass", subtitleIndex: nil, isASS: true))
+        let styled = TranscodePlanner.plan(info: hdr, intent: .airPlay, selectedAudioID: 2, burnInSubtitle: ass).steps[0]
+        XCTAssertFalse(styled.videoArguments[1].contains("force_style"))
+    }
+
+    func testTextBurnInArgumentsKeepSingleInputAndDropSubtitleTrack() throws {
+        let source = withPGS(video("h264", profile: "High", pixelFormat: "yuv420p"))
+        let text = SubtitleBurnIn(source: .text(path: "/in.mkv", subtitleIndex: 1, isASS: false))
+        let step = TranscodePlanner.plan(info: source, intent: .local, selectedAudioID: 2, burnInSubtitle: text).steps[0]
+        let selection = TrackSelection(audioID: 2, subtitleID: 4, subtitlePolicy: .burnInSelected)
+        let args = try TranscodeService.ffmpegArguments(input: URL(fileURLWithPath: "/in.mkv"),
+            output: URL(fileURLWithPath: "/out.mp4"), step: step, selection: selection, sourceHasAudio: true,
+            syncAdjustment: SyncAdjustment(subtitleMilliseconds: 400))
+        XCTAssertEqual(args.indices.filter { args[$0] == "-i" }.count, 1)
+        XCTAssertEqual(args.indices.filter { args[$0] == "-map" }.map { args[$0 + 1] }, ["0:v:0", "0:2"])
+        XCTAssertTrue(args.contains("-sn"))
+        XCTAssertFalse(args.contains("mov_text"))
+        XCTAssertFalse(args.contains("-bsf:s"))
+        XCTAssertFalse(args.contains("-filter_complex"))
+    }
+
+    @MainActor
+    func testStoreKeepsBurnInAcrossSubtitleChanges() {
+        let store = PlaylistStore(preferencesStore: PlaybackPreferencesStore(defaults: UserDefaults(suiteName: UUID().uuidString)!))
+        let item = MediaItem(fileURL: URL(fileURLWithPath: "/tmp/Film.mkv"))
+        store.setSubtitleBurnIn(true, for: item)
+        XCTAssertEqual(item.trackSelection.subtitlePolicy, .omit, "No subtitle selected, nothing to burn in")
+        store.chooseSubtitle(4, for: item)
+        XCTAssertEqual(item.trackSelection.subtitlePolicy, .includeSelected)
+        store.setSubtitleBurnIn(true, for: item)
+        XCTAssertEqual(item.trackSelection.subtitlePolicy, .burnInSelected)
+        store.chooseSubtitle(5, for: item)
+        XCTAssertEqual(item.trackSelection.subtitlePolicy, .burnInSelected)
+        store.chooseSubtitle(nil, for: item)
+        XCTAssertEqual(item.trackSelection.subtitlePolicy, .omit)
+    }
+
+    func testCachedCopyMustMatchSubtitlePolicy() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("source.mkv")
+        let output = directory.appendingPathComponent("source_airplay.mp4")
+        try Data("source".utf8).write(to: source)
+        try Data("output".utf8).write(to: output)
+        let soft = TrackSelection(audioID: nil, subtitleID: 4, subtitlePolicy: .includeSelected)
+        let burned = TrackSelection(audioID: nil, subtitleID: 4, subtitlePolicy: .burnInSelected)
+        // A manifest written before burn-in existed has no policy: the subtitle was a track.
+        try MediaArtifactValidator.writeManifest(source: source, artifact: output, sourceHadAudio: false,
+            selectedAudioID: nil, expectedDuration: nil, requiresHVC1: false, selectedSubtitle: .embedded(streamID: 4))
+        let legacyBurn = await MediaArtifactValidator.validateCached(output, source: source, expectedSelection: burned)
+        XCTAssertEqual(legacyBurn.reason, "No current artifact manifest")
+        let legacySoft = await MediaArtifactValidator.validateCached(output, source: source, expectedSelection: soft)
+        XCTAssertNotEqual(legacySoft.reason, "No current artifact manifest")
+        try MediaArtifactValidator.writeManifest(source: source, artifact: output, sourceHadAudio: false,
+            selectedAudioID: nil, expectedDuration: nil, requiresHVC1: false, selectedSubtitle: .embedded(streamID: 4),
+            subtitlePolicy: .burnInSelected)
+        let burnedCache = await MediaArtifactValidator.validateCached(output, source: source, expectedSelection: burned)
+        XCTAssertNotEqual(burnedCache.reason, "No current artifact manifest")
+    }
+
     func testProbeToleratesUnexpectedSideDataFieldTypes() throws {
         let data = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","side_data_list":[{"side_data_type":7,"rotation":"ninety","dv_profile":"eight"}]}],"format":{"format_name":"mp4","duration":"1.0"}}"#.data(using: .utf8)!
         let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))

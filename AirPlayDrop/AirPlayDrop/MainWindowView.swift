@@ -24,6 +24,7 @@ struct MainWindowView: View {
                 onChooseSubtitle: { store.chooseSubtitle($1, for: $0) },
                 onChooseSubtitleSelection: { store.chooseSubtitle($1, for: $0) },
                 onAttachSubtitle: { attachSubtitle(to: $0) },
+                onSetSubtitleBurnIn: { store.setSubtitleBurnIn($1, for: $0) },
                 onSetAudioProcessingMode: { store.setAudioProcessingMode($1, for: $0) },
                 onAdjustSynchronization: { synchronizationItem = $0 }
             )

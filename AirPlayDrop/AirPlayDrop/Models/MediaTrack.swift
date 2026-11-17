@@ -146,8 +146,17 @@ struct MediaInfo: Codable, Equatable, Sendable {
 enum SubtitlePolicy: String, Codable, CaseIterable, Sendable {
     case omit
     case includeSelected
+    /// Render the selected text subtitle into the picture. Bitmap subtitles
+    /// are always burned in, because MP4 cannot carry them.
+    case burnInSelected
 
-    var label: String { self == .omit ? "No subtitles" : "Include selected subtitle" }
+    var label: String {
+        switch self {
+        case .omit: return "No subtitles"
+        case .includeSelected: return "Include selected subtitle"
+        case .burnInSelected: return "Burn selected subtitle into video"
+        }
+    }
 }
 
 struct ExternalSubtitleDescriptor: Codable, Equatable, Sendable {
@@ -232,7 +241,12 @@ struct TrackSelection: Codable, Equatable, Sendable {
     }
 
     var hasSelectedSubtitle: Bool {
-        subtitlePolicy == .includeSelected && !subtitle.isNone
+        subtitlePolicy != .omit && !subtitle.isNone
+    }
+
+    /// The policy as it affects the output: no subtitle means nothing to include.
+    var effectiveSubtitlePolicy: SubtitlePolicy {
+        subtitle.isNone ? .omit : subtitlePolicy
     }
 }
 
@@ -303,14 +317,16 @@ struct ConversionStep: Equatable, Sendable {
     let requiredTransfer: String?
     /// The output must keep a `dvh1` sample entry and Dolby Vision configuration box.
     let requiresDolbyVision: Bool
-    /// The video arguments draw the selected subtitle into the picture through
-    /// a filter graph, so the stream mapping uses its output instead of the
-    /// source video and does not carry the subtitle stream.
-    let burnsInSubtitle: Bool
+    /// The subtitle the video arguments draw into the picture. A bitmap
+    /// burn-in maps the filter graph's output instead of the source video and
+    /// reads the subtitle from a second input; any burn-in drops the subtitle
+    /// stream from the output.
+    let subtitleBurnIn: SubtitleBurnIn?
+    var burnsInSubtitle: Bool { subtitleBurnIn != nil }
 
     init(strategy: ConversionStrategy, reason: String, videoArguments: [String], audioArguments: [String],
          requiresHVC1: Bool, audioProcessingMode: AudioProcessingMode = .standard,
-         requiredTransfer: String? = nil, requiresDolbyVision: Bool = false, burnsInSubtitle: Bool = false) {
+         requiredTransfer: String? = nil, requiresDolbyVision: Bool = false, subtitleBurnIn: SubtitleBurnIn? = nil) {
         self.strategy = strategy
         self.reason = reason
         self.videoArguments = videoArguments
@@ -319,7 +335,7 @@ struct ConversionStep: Equatable, Sendable {
         self.audioProcessingMode = audioProcessingMode
         self.requiredTransfer = requiredTransfer
         self.requiresDolbyVision = requiresDolbyVision
-        self.burnsInSubtitle = burnsInSubtitle
+        self.subtitleBurnIn = subtitleBurnIn
     }
 }
 
@@ -399,17 +415,56 @@ enum HDRVideoArguments {
 
 /// A bitmap subtitle stream drawn onto the video during an encode.
 struct SubtitleBurnIn: Equatable, Sendable {
-    /// Absolute source stream index of the subtitle.
-    let streamID: Int
+    enum Source: Equatable, Sendable {
+        /// A bitmap track, overlaid from a second input of the source file.
+        case bitmap(streamID: Int)
+        /// A text subtitle rendered by libass from a file: the source with the
+        /// track's position among its subtitle streams, or a sidecar file.
+        case text(path: String, subtitleIndex: Int?, isASS: Bool)
+    }
+
+    let source: Source
     /// Subtitle sync offset; positive values show cues later.
     var offsetSeconds: Double = 0
 
-    /// A burn-in for the selected embedded subtitle when it is a bitmap track.
+    init(source: Source, offsetSeconds: Double = 0) {
+        self.source = source
+        self.offsetSeconds = offsetSeconds
+    }
+
+    init(streamID: Int, offsetSeconds: Double = 0) {
+        self.init(source: .bitmap(streamID: streamID), offsetSeconds: offsetSeconds)
+    }
+
+    var isBitmap: Bool {
+        if case .bitmap = source { return true }
+        return false
+    }
+
+    /// The burn-in for the current selection: a bitmap track always, and a
+    /// text track or sidecar when the policy asks for burn-in. Embedded text
+    /// needs the source path, which libass reads directly.
     static func selected(in info: MediaInfo, selection: TrackSelection,
-                         syncAdjustment: SyncAdjustment = .zero) -> SubtitleBurnIn? {
-        guard selection.hasSelectedSubtitle, let id = selection.subtitle.embeddedID,
-              info.subtitleTracks.first(where: { $0.id == id })?.isBitmapSubtitle == true else { return nil }
-        return SubtitleBurnIn(streamID: id, offsetSeconds: Double(syncAdjustment.subtitleMilliseconds) / 1000)
+                         syncAdjustment: SyncAdjustment = .zero, input: URL? = nil) -> SubtitleBurnIn? {
+        guard selection.hasSelectedSubtitle else { return nil }
+        let offset = Double(syncAdjustment.subtitleMilliseconds) / 1000
+        switch selection.subtitle {
+        case .embedded(let id):
+            guard let track = info.subtitleTracks.first(where: { $0.id == id }) else { return nil }
+            if track.isBitmapSubtitle { return SubtitleBurnIn(streamID: id, offsetSeconds: offset) }
+            guard selection.subtitlePolicy == .burnInSelected, track.isTextSubtitle, let input,
+                  let index = info.subtitleTracks.firstIndex(where: { $0.id == id }) else { return nil }
+            return SubtitleBurnIn(source: .text(path: input.path, subtitleIndex: index,
+                                                isASS: ["ass", "ssa"].contains(track.codec)), offsetSeconds: offset)
+        case .external(let descriptor):
+            guard selection.subtitlePolicy == .burnInSelected else { return nil }
+            let url = descriptor.standardizedURL
+            return SubtitleBurnIn(source: .text(path: url.path, subtitleIndex: nil,
+                                                isASS: ["ass", "ssa"].contains(url.pathExtension.lowercased())),
+                                  offsetSeconds: offset)
+        case .none:
+            return nil
+        }
     }
 
     /// Graphics brightness for HDR video. Bitmap subtitles are authored for
@@ -450,6 +505,12 @@ enum VideoFilterGraph {
             let filters = pre + post
             return filters.isEmpty ? [] : ["-vf", filters.joined(separator: ",")]
         }
+        if case .text(let path, let index, let isASS) = burnIn.source {
+            return ["-vf", (pre + textSubtitleFilters(path: path, subtitleIndex: index, isASS: isASS,
+                offsetSeconds: burnIn.offsetSeconds, info: info, outputIsHDR: outputIsHDR) + post)
+                .joined(separator: ",")]
+        }
+        guard case .bitmap(let streamID) = burnIn.source else { return [] }
         var subtitle: [String] = []
         if burnIn.offsetSeconds != 0 {
             subtitle.append("setpts=PTS+\(String(format: "%.3f", burnIn.offsetSeconds))/TB")
@@ -458,10 +519,59 @@ enum VideoFilterGraph {
             subtitle.append("colorchannelmixer=rr=\(scale):gg=\(scale):bb=\(scale)")
         }
         let base = "[0:v:0]" + (pre.isEmpty ? "null" : pre.joined(separator: ",")) + "[base]"
-        let sub = "[\(subtitleInput):\(burnIn.streamID)]" + (subtitle.isEmpty ? "null" : subtitle.joined(separator: ",")) + "[sub]"
+        let sub = "[\(subtitleInput):\(streamID)]" + (subtitle.isEmpty ? "null" : subtitle.joined(separator: ",")) + "[sub]"
         let overlay = "[base][sub]" + (["overlay=x=(W-w)/2:y=H-h:eof_action=pass:format=auto"] + post)
             .joined(separator: ",") + outputLabel
         return ["-filter_complex", [base, sub, overlay].joined(separator: ";")]
+    }
+
+    /// libass renders text with `subtitles`, which has no time offset, so the
+    /// video timestamps are shifted around it instead. On HDR output, plain
+    /// text subtitles (SRT, WebVTT, mov_text) use a dimmed default colour at
+    /// BT.2408 graphics white; ASS keeps its authored styles.
+    static func textSubtitleFilters(path: String, subtitleIndex: Int?, isASS: Bool, offsetSeconds: Double,
+                                    info: MediaInfo, outputIsHDR: Bool) -> [String] {
+        var options = "filename=" + FilterEscaping.value(path)
+        if let subtitleIndex { options += ":si=\(subtitleIndex)" }
+        if outputIsHDR, !isASS, let scale = SubtitleBurnIn.hdrGraphicsScale(for: info.hdrTransfer) {
+            let level = String(format: "%02X", Int((255 * scale).rounded()))
+            options += ":force_style=" + FilterEscaping.value("PrimaryColour=&H00\(level)\(level)\(level)")
+        }
+        // libass is built without libunibreak, so Unicode line breaking is off.
+        options += ":wrap_unicode=0"
+        let shift = offsetSeconds == 0 ? nil : String(format: "%.3f", abs(offsetSeconds))
+        let (before, after) = offsetSeconds > 0 ? ("-", "+") : ("+", "-")
+        return (shift.map { ["setpts=PTS\(before)\($0)/TB"] } ?? []) + ["subtitles=" + options]
+            + (shift.map { ["setpts=PTS\(after)\($0)/TB"] } ?? [])
+    }
+}
+
+/// FFmpeg filtergraph escaping for option values such as file paths.
+///
+/// A value is escaped twice: once for the filter's option parser (`\`, `'`
+/// and `:`), then for the filtergraph parser (`\`, `'`, `[`, `]`, `,`, `;`),
+/// as FFmpeg's filter documentation describes. Arguments are passed to FFmpeg
+/// directly, so no shell quoting is involved.
+enum FilterEscaping {
+    static func value(_ raw: String) -> String {
+        graph(option(raw))
+    }
+
+    static func option(_ raw: String) -> String {
+        escape(raw, characters: ["\\", "'", ":"])
+    }
+
+    static func graph(_ raw: String) -> String {
+        escape(raw, characters: ["\\", "'", "[", "]", ",", ";"])
+    }
+
+    private static func escape(_ raw: String, characters: Set<Character>) -> String {
+        var result = ""
+        for character in raw {
+            if characters.contains(character) { result.append("\\") }
+            result.append(character)
+        }
+        return result
     }
 }
 
@@ -786,7 +896,9 @@ enum TranscodePlanner {
                             receiver: intent == .airPlay ? receiver : .appleTV4K, canToneMap: canToneMap)
         guard burnInSubtitle != nil, plan.steps.allSatisfy(\.burnsInSubtitle), !plan.steps.isEmpty else { return plan }
         return ConversionPlan(intent: intent, steps: plan.steps,
-            reason: "The selected bitmap subtitle is burned into the video, which needs a full video encode.")
+            reason: burnInSubtitle?.isBitmap == true
+                ? "The selected bitmap subtitle is burned into the video, which needs a full video encode."
+                : "The selected subtitle is burned into the video, which needs a full video encode.")
     }
 
     private static func basePlan(info: MediaInfo, intent: PlaybackIntent, selectedAudioID: Int?,
@@ -829,7 +941,7 @@ enum TranscodePlanner {
                 ConversionStep(strategy: strategy, reason: reason, videoArguments: videoArguments,
                     audioArguments: $0, requiresHVC1: requiresHVC1,
                     audioProcessingMode: audioProcessingMode, requiredTransfer: requiredTransfer,
-                    burnsInSubtitle: burnInSubtitle != nil)
+                    subtitleBurnIn: burnInSubtitle)
             }
         }
 

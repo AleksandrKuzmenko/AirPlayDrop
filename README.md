@@ -9,7 +9,7 @@ The project is currently a **0.1.x alpha**. The release process produces an arm6
 - Drag-and-drop playlist and native macOS playback controls.
 - AirPlay route selection and an explicit **Prepare for Apple TV / AirPlay** workflow.
 - Media probing before conversion, with named remux, audio-conversion, and Apple VideoToolbox hardware-encode strategies.
-- Per-file audio-track and subtitle selection. Text subtitles are kept as selectable MP4 subtitles; bitmap subtitles (Blu-ray PGS, DVD VobSub, DVB) are burned into the picture.
+- Per-file audio-track and subtitle selection. Text subtitles are kept as selectable MP4 subtitles, or burned into the picture with **Burn Into Video**, keeping ASS styling; bitmap subtitles (Blu-ray PGS, DVD VobSub, DVB) are always burned in.
 - Preferred audio and subtitle languages for newly imported files.
 - Automatic discovery and manual attachment of external `.srt`, `.vtt`, `.ass`, and `.ssa` subtitles.
 - Per-file audio and subtitle synchronization adjustment from -10 to +10 seconds.
@@ -71,7 +71,7 @@ The resulting development app is stored under Xcode's DerivedData directory. For
 
 Prepared MP4 files and their `.airplay.json` validation manifests are written beside the source video. The original media file is never overwritten. Changing track, synchronization, subtitle, or audio-processing choices invalidates the prepared selection and requires preparation again.
 
-Playback language preferences apply to files imported after the preference changes. Late Night mode uses dynamic-range compression and limiting; it is not speech isolation. Text subtitles stay as separate MP4 subtitle tracks. Bitmap subtitles such as PGS cannot be stored in MP4 and are not converted to text, so choosing one burns it into the picture, which always needs a full video encode, takes longer, and can't be turned off during playback. Bitmap subtitles are never chosen automatically. On HDR video they are dimmed to BT.2408's 203-nit graphics white so they are not shown at peak brightness. Dolby Vision profile 5 video can't have subtitles burned in.
+Playback language preferences apply to files imported after the preference changes. Late Night mode uses dynamic-range compression and limiting; it is not speech isolation. Text subtitles stay as separate MP4 subtitle tracks unless **Burn Into Video** is turned on in the item's Subtitles menu; burning in renders them with libass, keeps ASS styling, and needs a full video encode. Bitmap subtitles such as PGS cannot be stored in MP4 and are not converted to text, so choosing one burns it into the picture, which always needs a full video encode, takes longer, and can't be turned off during playback. Bitmap subtitles are never chosen automatically. On HDR video they are dimmed to BT.2408's 203-nit graphics white so they are not shown at peak brightness. Dolby Vision profile 5 video can't have subtitles burned in.
 
 ## Privacy and local data
 

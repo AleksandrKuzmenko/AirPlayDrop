@@ -8,6 +8,8 @@ AirPlayDrop binary releases target Apple silicon only (`arm64`) on macOS 14 or l
 
 The script also downloads the pinned dav1d 1.5.4 source from VideoLAN, verifies its SHA-256 checksum, and links it statically for software AV1 decoding. FFmpeg's built-in AV1 decoder needs a hardware accelerator, which Apple silicon only provides from M3 onward. Building dav1d requires `meson`, `ninja`, and `pkg-config` (`brew install meson ninja pkgconf`).
 
+For text subtitle burn-in, the script builds pinned libass 0.17.5, HarfBuzz 15.0.0, FriBidi 1.0.18, and FreeType 2.15.0 as static libraries with Meson, with subproject downloads disabled, and enables FFmpeg's `subtitles` filter. Their checksums match Homebrew's pinned values. libass uses macOS Core Text for fonts, so fontconfig is not built. FriBidi is LGPL, so its source archive and checksum are published beside the DMG together with FFmpeg's; the other licenses ship inside the app.
+
 The build script rejects non-arm64 output and package-manager library linkage. It also checks for the encoders, filters, and bitstream filters used by AirPlayDrop. The app runs FFmpeg as a separate executable; it does not link FFmpeg libraries into the Swift application.
 
 Each release ships the LGPL and FFmpeg license notices inside the app. The exact verified FFmpeg source archive and its checksum are published beside the DMG. `THIRD_PARTY_NOTICES.md` records the version, source URL, configure policy, and source checksum.
@@ -17,10 +19,10 @@ Each release ships the LGPL and FFmpeg license notices inside the app. The exact
 The release Mac must have:
 
 - Apple silicon and the supported Xcode command-line tools;
-- `meson`, `ninja`, and `pkg-config` for the dav1d build;
+- `meson`, `ninja`, and `pkg-config` for the dav1d and libass builds;
 - a valid `Developer ID Application` certificate in the login keychain;
 - App Store Connect notarization credentials saved as a `notarytool` keychain profile; and
-- access to `ffmpeg.org`, `downloads.videolan.org`, and Apple's notarization service.
+- access to `ffmpeg.org`, `downloads.videolan.org`, `github.com`, `downloads.sourceforge.net`, and Apple's notarization service.
 
 Store notarization credentials locally without putting secrets in the repository or shell history:
 

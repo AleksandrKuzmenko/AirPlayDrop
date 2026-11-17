@@ -13,6 +13,7 @@ struct PlaylistView: View {
     let onChooseSubtitle: (MediaItem, Int?) -> Void
     let onChooseSubtitleSelection: (MediaItem, SubtitleSelection) -> Void
     let onAttachSubtitle: (MediaItem) -> Void
+    let onSetSubtitleBurnIn: (MediaItem, Bool) -> Void
     let onSetAudioProcessingMode: (MediaItem, AudioProcessingMode) -> Void
     let onAdjustSynchronization: (MediaItem) -> Void
 
@@ -130,6 +131,12 @@ struct PlaylistView: View {
                                     }
                                 }
                                 Divider()
+                                // Text subtitles stay a separate track unless burned in;
+                                // burning in re-encodes the video.
+                                Toggle("Burn Into Video", isOn: Binding(
+                                    get: { item.trackSelection.subtitlePolicy == .burnInSelected },
+                                    set: { onSetSubtitleBurnIn(item, $0) }))
+                                    .disabled(item.trackSelection.subtitle.isNone || selectedSubtitleIsBitmap(item))
                                 Button("Attach Subtitle…") { onAttachSubtitle(item) }
                             }
                         }
@@ -165,6 +172,12 @@ struct PlaylistView: View {
                   let item = store.items.first(where: { $0.id == id }) else { return }
             onRemove(item)
         }
+    }
+
+    /// Bitmap tracks are always burned in, so the toggle doesn't apply.
+    private func selectedSubtitleIsBitmap(_ item: MediaItem) -> Bool {
+        guard let id = item.trackSelection.subtitleID else { return false }
+        return item.mediaInfo?.subtitleTracks.first(where: { $0.id == id })?.isBitmapSubtitle == true
     }
 }
 

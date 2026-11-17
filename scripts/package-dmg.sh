@@ -26,11 +26,19 @@ xcodebuild \
 
 app="$derived_data/Build/Products/Release/AirPlayDrop.app"
 resources="$app/Contents/Resources"
-mkdir -p "$resources/bin" "$resources/Licenses/FFmpeg" "$resources/Licenses/dav1d"
+mkdir -p "$resources/bin" "$resources/Licenses/FFmpeg" "$resources/Licenses/dav1d" \
+  "$resources/Licenses/libass" "$resources/Licenses/HarfBuzz" "$resources/Licenses/FriBidi" \
+  "$resources/Licenses/FreeType"
 cp "$ffmpeg_root/bin/ffmpeg" "$ffmpeg_root/bin/ffprobe" "$resources/bin/"
 cp "$ffmpeg_root/licenses/FFmpeg-LGPL-2.1.txt" "$ffmpeg_root/licenses/FFmpeg-LICENSE.md" \
   "$resources/Licenses/FFmpeg/"
 cp "$ffmpeg_root/licenses/dav1d-COPYING.txt" "$resources/Licenses/dav1d/COPYING.txt"
+cp "$ffmpeg_root/licenses/libass-COPYING.txt" "$resources/Licenses/libass/COPYING.txt"
+cp "$ffmpeg_root/licenses/HarfBuzz-COPYING.txt" "$resources/Licenses/HarfBuzz/COPYING.txt"
+cp "$ffmpeg_root/licenses/HarfBuzz-ms-use-COPYING.txt" "$resources/Licenses/HarfBuzz/ms-use-COPYING.txt"
+cp "$ffmpeg_root/licenses/FriBidi-COPYING.txt" "$resources/Licenses/FriBidi/COPYING.txt"
+cp "$ffmpeg_root/licenses/FreeType-LICENSE.txt" "$resources/Licenses/FreeType/LICENSE.txt"
+cp "$ffmpeg_root/licenses/FreeType-FTL.txt" "$resources/Licenses/FreeType/FTL.txt"
 cp "$repo_root/THIRD_PARTY_NOTICES.md" "$resources/"
 
 if [ -z "$identity" ]; then
@@ -86,6 +94,8 @@ if [ "$identity" != "-" ]; then
 fi
 
 cp "$ffmpeg_root/licenses/ffmpeg-9.0.2.tar.xz" "$ffmpeg_root/licenses/ffmpeg-9.0.2.tar.xz.sha256" "$dist_dir/"
+# FriBidi is LGPL and statically linked into ffmpeg, so its source ships too.
+cp "$ffmpeg_root/licenses/fribidi-1.0.18.tar.xz" "$ffmpeg_root/licenses/fribidi-1.0.18.tar.xz.sha256" "$dist_dir/"
 dmg_name=$(basename "$dmg")
 (cd "$dist_dir" && shasum -a 256 "$dmg_name" > "$dmg_name.sha256")
 echo "Created $dmg"

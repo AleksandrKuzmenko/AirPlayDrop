@@ -251,15 +251,17 @@ enum TranscodeService {
             if offset != 0 { arguments += ["-itsoffset", String(format: "%.3f", offset)] }
             arguments += ["-i", descriptor.standardizedURL.path]
         }
-        if step.burnsInSubtitle {
-            // The filter graph reads the subtitle from a second input of the
-            // same file and outputs [v]; see VideoFilterGraph for why.
-            arguments += ["-i", input.path]
+        if let burnIn = step.subtitleBurnIn {
             var videoOnly = selection
             videoOnly.subtitle = .none
             videoOnly.subtitlePolicy = .omit
             var mapping = try streamArguments(selection: videoOnly, sourceHasAudio: sourceHasAudio)
-            if let video = mapping.firstIndex(of: "0:v:0") { mapping[video] = VideoFilterGraph.outputLabel }
+            if burnIn.isBitmap {
+                // The filter graph reads the subtitle from a second input of
+                // the same file and outputs [v]; see VideoFilterGraph for why.
+                arguments += ["-i", input.path]
+                if let video = mapping.firstIndex(of: "0:v:0") { mapping[video] = VideoFilterGraph.outputLabel }
+            }
             arguments += mapping
             arguments += step.videoArguments
             if selection.audioID != nil {
@@ -342,15 +344,20 @@ enum TranscodeService {
                 logger.warning("FFmpeg has no bwdif or yadif filter; interlaced video is encoded without deinterlacing.")
             }
         }
-        let burnIn = SubtitleBurnIn.selected(in: info, selection: selection, syncAdjustment: syncAdjustment)
-        if burnIn != nil {
+        let burnIn = SubtitleBurnIn.selected(in: info, selection: selection, syncAdjustment: syncAdjustment,
+                                             input: input)
+        if let burnIn {
             if info.isDolbyVisionProfile5 {
-                throw TranscodeError.subtitleBurnInUnavailable("Dolby Vision profile 5 video cannot be re-encoded without wrong colours. Choose a text subtitle or none.")
+                throw TranscodeError.subtitleBurnInUnavailable("Dolby Vision profile 5 video cannot be re-encoded without wrong colours. Keep text subtitles as a separate track, or choose none.")
+            }
+            if case .text(let path, _, _) = burnIn.source,
+               !FileManager.default.isReadableFile(atPath: path) {
+                throw TranscodeError.externalSubtitleUnavailable("\(URL(fileURLWithPath: path).lastPathComponent) can't be read")
             }
             let filters = await filterNames(using: installation)
-            let needed = ["overlay", "setpts", "colorchannelmixer"]
+            let needed = burnIn.isBitmap ? ["overlay", "setpts", "colorchannelmixer"] : ["subtitles", "setpts"]
             guard needed.allSatisfy(filters.contains) else {
-                throw TranscodeError.subtitleBurnInUnavailable("the selected FFmpeg lacks the overlay, setpts, or colorchannelmixer filter. Use the bundled FFmpeg.")
+                throw TranscodeError.subtitleBurnInUnavailable("the selected FFmpeg lacks the \(needed.joined(separator: ", ")) filters. Use the bundled FFmpeg.")
             }
         }
         var canToneMap = false
@@ -422,7 +429,8 @@ enum TranscodeService {
                         selectedSubtitle: selection.subtitle, syncAdjustment: syncAdjustment,
                         audioProcessingMode: audioProcessingMode, playbackIntent: intent,
                         requiredTransfer: step.requiredTransfer, requiresDolbyVision: step.requiresDolbyVision,
-                        airPlayReceiver: intent == .airPlay ? receiver : nil)
+                        airPlayReceiver: intent == .airPlay ? receiver : nil,
+                        subtitlePolicy: selection.effectiveSubtitlePolicy)
                 } catch {
                     try? FileManager.default.removeItem(at: reservation.destination)
                     throw error

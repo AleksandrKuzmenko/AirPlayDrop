@@ -32,6 +32,9 @@ struct MediaArtifactManifest: Codable, Sendable {
     let requiresDolbyVision: Bool?
     /// Receiver an AirPlay copy was prepared for; absent means Apple TV 4K.
     let airPlayReceiver: AirPlayReceiver?
+    /// Whether the selected subtitle is a track or burned in; absent before
+    /// text burn-in existed, when selected text was always a track.
+    let subtitlePolicy: SubtitlePolicy?
 }
 
 enum MediaArtifactError: LocalizedError {
@@ -66,7 +69,8 @@ enum MediaArtifactValidator {
                               playbackIntent: PlaybackIntent = .local,
                               requiredTransfer: String? = nil,
                               requiresDolbyVision: Bool = false,
-                              airPlayReceiver: AirPlayReceiver? = nil) throws {
+                              airPlayReceiver: AirPlayReceiver? = nil,
+                              subtitlePolicy: SubtitlePolicy? = nil) throws {
         guard let fingerprint = sourceFingerprint(source) else { throw MediaArtifactError.missingFingerprint }
         guard let outputValues = try? artifact.resourceValues(forKeys: [.fileSizeKey]),
               let outputSize = outputValues.fileSize else { throw MediaArtifactError.missingOutputSize }
@@ -80,7 +84,8 @@ enum MediaArtifactValidator {
             playbackIntent: playbackIntent, requiredTransfer: requiredTransfer,
             appleTVRulesVersion: playbackIntent == .airPlay ? AppleTVVideoCompatibility.rulesVersion : nil,
             requiresDolbyVision: requiresDolbyVision,
-            airPlayReceiver: playbackIntent == .airPlay ? (airPlayReceiver ?? .appleTV4K) : nil)
+            airPlayReceiver: playbackIntent == .airPlay ? (airPlayReceiver ?? .appleTV4K) : nil,
+            subtitlePolicy: subtitlePolicy)
         let data = try JSONEncoder().encode(manifest)
         try data.write(to: manifestURL(for: artifact), options: .atomic)
     }
@@ -102,6 +107,8 @@ enum MediaArtifactValidator {
               manifest.sourceModification == fingerprint.1,
               manifest.selectedAudioID == (expectedSelection?.audioID ?? expectedSelectedAudioID),
               manifest.selectedSubtitle == (expectedSelection?.subtitle ?? .none),
+              (manifest.subtitlePolicy ?? (manifest.selectedSubtitle.isNone ? .omit : .includeSelected))
+                == (expectedSelection?.effectiveSubtitlePolicy ?? .omit),
               manifest.syncAdjustment == expectedSyncAdjustment,
               manifest.audioProcessingMode == expectedAudioProcessingMode,
               manifest.audioProcessingPresetVersion == AudioProcessingPreset.version,
