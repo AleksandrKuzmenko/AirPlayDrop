@@ -110,7 +110,7 @@ cd "$build_dir"
   --disable-muxers \
   --enable-muxer=mp4,mov \
   --disable-filters \
-  --enable-filter=acompressor,adelay,aformat,alimiter,anull,aresample,asetpts,atrim,format,null,scale,setparams \
+  --enable-filter=acompressor,adelay,aformat,alimiter,anull,aresample,asetpts,atrim,bwdif,format,null,scale,setparams \
   --disable-protocols \
   --enable-protocol=file,pipe \
   --disable-indevs \
@@ -146,6 +146,7 @@ done
 "$install_dir/bin/ffmpeg" -hide_banner -filters 2>&1 | grep -q 'atrim'
 "$install_dir/bin/ffmpeg" -hide_banner -filters 2>&1 | grep -q 'asetpts'
 "$install_dir/bin/ffmpeg" -hide_banner -filters 2>&1 | grep -q 'setparams'
+"$install_dir/bin/ffmpeg" -hide_banner -filters 2>&1 | grep -q 'bwdif'
 "$install_dir/bin/ffmpeg" -hide_banner -bsfs 2>&1 | grep -q 'filter_units'
 "$install_dir/bin/ffmpeg" -hide_banner -bsfs 2>&1 | grep -q 'setts'
 "$install_dir/bin/ffmpeg" -hide_banner -muxers 2>&1 | grep -q 'mp4'

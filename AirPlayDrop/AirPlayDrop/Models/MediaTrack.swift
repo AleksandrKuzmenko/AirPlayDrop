@@ -85,6 +85,18 @@ struct MediaInfo: Codable, Equatable, Sendable {
     /// Best available estimate of the source video bit rate. The container
     /// rate includes audio, so it errs high, which is safe for a ceiling.
     var estimatedVideoBitRate: Int? { videoBitRate ?? containerBitRate }
+    /// FFprobe `field_order`: `progressive`, or `tt`, `bb`, `tb`, `bt` for interlaced video.
+    var fieldOrder: String? = nil
+
+    var isInterlaced: Bool { ["tt", "bb", "tb", "bt"].contains(fieldOrder) }
+
+    /// Frame rate after deinterlacing. Every field becomes a frame, so 25i
+    /// becomes 50p and 29.97i becomes 59.94p, as Apple recommends.
+    var deinterlacedAverageFrameRate: String? {
+        guard isInterlaced, let (numerator, denominator) = AppleTVVideoCompatibility.rational(averageFrameRate),
+              numerator > 0 else { return averageFrameRate }
+        return "\(numerator * 2)/\(denominator)"
+    }
 
     /// Frames per second, or nil when FFprobe could not determine the rate.
     var frameRate: Double? {
@@ -348,10 +360,12 @@ enum HDRVideoArguments {
     /// `-color_trc`-style output options, so the tags are set on the frames
     /// with `setparams`. Missing source primaries or matrix default to
     /// BT.2020, which HDR10 and HLG both specify.
-    static func hevcMain10(for info: MediaInfo, intent: PlaybackIntent = .local) -> [String] {
+    static func hevcMain10(for info: MediaInfo, intent: PlaybackIntent = .local,
+                           deinterlaceFilter: String? = Deinterlace.filter) -> [String] {
         let limits = intent == .airPlay ? AppleTVVideoCompatibility.conformingArguments(for: info)
                                         : (filters: [], output: [])
-        let filters = limits.filters + [colorFilter(for: info)].compactMap { $0 }
+        let filters = Deinterlace.filters(for: info, filter: deinterlaceFilter) + limits.filters
+            + [colorFilter(for: info)].compactMap { $0 }
         return (filters.isEmpty ? [] : ["-vf", filters.joined(separator: ",")]) + limits.output
             + ["-c:v", "hevc_videotoolbox", "-profile:v", "main10", "-pix_fmt", "p010le",
                "-b:v", "\(VideoBitRate.kilobits(for: info, intent: intent, target: .hevcHDR))k", "-tag:v", "hvc1"]
@@ -367,6 +381,21 @@ enum HDRVideoArguments {
     private static func known(_ value: String?) -> String? {
         guard let value, !["unknown", "unspecified", "reserved"].contains(value) else { return nil }
         return value
+    }
+}
+
+/// Deinterlacing for encodes of interlaced sources.
+///
+/// Apple's HLS authoring specification says all interlaced content must be
+/// deinterlaced, and that 30i should become 60p rather than 30p. `bwdif`
+/// (LGPL) outputs one frame per field, which does both. Stream copies keep
+/// the source fields: macOS deinterlaces on display, and AirPlay never
+/// copies interlaced video.
+enum Deinterlace {
+    static let filter = "bwdif=mode=send_field:parity=auto:deint=all"
+
+    static func filters(for info: MediaInfo, filter: String?) -> [String] {
+        info.isInterlaced ? [filter].compactMap { $0 } : []
     }
 }
 
@@ -459,7 +488,9 @@ enum VideoBitRate {
     }
 
     static func outputFrameRate(for info: MediaInfo, intent: PlaybackIntent) -> Double? {
-        guard let rate = info.frameRate else { return nil }
+        guard let (numerator, denominator) = AppleTVVideoCompatibility.rational(info.deinterlacedAverageFrameRate),
+              numerator > 0 else { return nil }
+        let rate = Double(numerator) / Double(denominator)
         guard intent == .airPlay, rate > AppleTVVideoCompatibility.frameRateLimit else { return rate }
         return rate / (rate / AppleTVVideoCompatibility.frameRateLimit).rounded(.up)
     }
@@ -473,7 +504,8 @@ enum VideoBitRate {
 /// 4:2:0 H.264 and 8- or 10-bit 4:2:0 HEVC, so High 10, 4:2:2, 4:4:4, and
 /// HEVC range-extension streams are converted even when the Mac plays them.
 /// The Apple TV 4K specifications (apple.com/apple-tv-4k/specs) give the
-/// "up to 2160p, 60 fps" ceiling.
+/// "up to 2160p, 60 fps" ceiling. The same HLS specification says all
+/// interlaced content must be deinterlaced, so interlaced video is converted.
 ///
 /// The rules are deliberately conservative where they are strict and lenient
 /// where probes are unreliable. AV1 and VP9 are always converted for AirPlay:
@@ -485,8 +517,9 @@ enum VideoBitRate {
 enum AppleTVVideoCompatibility {
     /// Bump when the rules or the AirPlay video preparation change, so AirPlay
     /// copies prepared earlier are re-prepared. Version 2 strips the Dolby
-    /// Vision profile 7 enhancement layer that version 1 copies kept.
-    static let rulesVersion = 2
+    /// Vision profile 7 enhancement layer that version 1 copies kept; version 3
+    /// deinterlaces video that earlier versions copied.
+    static let rulesVersion = 3
     static let maxLongSide = 4096
     static let maxShortSide = 2160
     static let maxFrameRate = 60.0
@@ -511,6 +544,7 @@ enum AppleTVVideoCompatibility {
         case pixelFormat(String)
         case resolution(width: Int, height: Int)
         case frameRate(Double)
+        case interlaced(String)
 
         var description: String {
             switch self {
@@ -519,6 +553,7 @@ enum AppleTVVideoCompatibility {
             case .pixelFormat(let format): return "\(format) pixels"
             case .resolution(let width, let height): return "\(width)×\(height) resolution"
             case .frameRate(let rate): return "\(String(format: "%.4g", rate)) fps"
+            case .interlaced: return "interlaced video"
             }
         }
     }
@@ -541,6 +576,9 @@ enum AppleTVVideoCompatibility {
         if let rate = info.frameRate, rate > frameRateLimit {
             issues.append(.frameRate(rate))
         }
+        if info.isInterlaced, let order = info.fieldOrder {
+            issues.append(.interlaced(order))
+        }
         return issues
     }
 
@@ -558,8 +596,9 @@ enum AppleTVVideoCompatibility {
             filters.append("scale=w=\(w):h=\(h):force_original_aspect_ratio=decrease:force_divisible_by=2")
         }
         var output: [String] = []
-        if let (numerator, denominator) = rational(info.averageFrameRate), let rate = info.frameRate,
-           rate > frameRateLimit {
+        // Deinterlacing doubles the frame rate before this cap applies.
+        if let (numerator, denominator) = rational(info.deinterlacedAverageFrameRate), numerator > 0,
+           case let rate = Double(numerator) / Double(denominator), rate > frameRateLimit {
             // Divide by a whole number so 120 becomes 60 and 119.88 becomes 59.94.
             let divisor = Int((rate / frameRateLimit).rounded(.up))
             output = ["-r", "\(numerator)/\(denominator * divisor)"]
@@ -597,14 +636,16 @@ enum TranscodePlanner {
                      audioProcessingMode: AudioProcessingMode = .standard,
                      syncAdjustment: SyncAdjustment = .zero,
                      requiresSubtitleMuxing: Bool = false,
-                     surroundEncoder: SurroundAudioEncoder = .eac3) -> ConversionPlan {
+                     surroundEncoder: SurroundAudioEncoder = .eac3,
+                     deinterlaceFilter: String? = Deinterlace.filter) -> ConversionPlan {
         let video = info.videoCodec?.lowercased()
         let appleTVIssues = intent == .airPlay ? AppleTVVideoCompatibility.issues(for: info) : []
         // Local playback copies any H.264/HEVC. AirPlay copies only video the Apple TV decodes.
         let canCopyVideo = ["h264", "hevc"].contains(video) && appleTVIssues.isEmpty
         let conforming = intent == .airPlay ? AppleTVVideoCompatibility.conformingArguments(for: info)
                                             : (filters: [], output: [])
-        let h264Filters = conforming.filters + ["format=yuv420p"]
+        let h264Filters = Deinterlace.filters(for: info, filter: deinterlaceFilter) + conforming.filters
+            + ["format=yuv420p"]
         let h264Encode = ["-vf", h264Filters.joined(separator: ",")] + conforming.output
             + ["-c:v", "h264_videotoolbox",
                "-b:v", "\(VideoBitRate.kilobits(for: info, intent: intent, target: .h264))k"]
@@ -671,7 +712,8 @@ enum TranscodePlanner {
                 : "HDR HEVC needs an AirPlay-safe MP4 sample entry."
             return ConversionPlan(intent: intent, steps: remux + encodeSteps(strategy: .hardwareEncode,
                     reason: "Re-encode HDR as HEVC Main 10 when the lossless HDR remux is rejected.",
-                    videoArguments: HDRVideoArguments.hevcMain10(for: info, intent: intent),
+                    videoArguments: HDRVideoArguments.hevcMain10(for: info, intent: intent,
+                        deinterlaceFilter: deinterlaceFilter),
                     requiresHVC1: true, requiredTransfer: info.hdrTransfer), reason: reason)
         }
 
@@ -681,7 +723,8 @@ enum TranscodePlanner {
         if let transfer = info.hdrTransfer, !canCopyVideo {
             return ConversionPlan(intent: intent, steps: encodeSteps(strategy: .hardwareEncode,
                     reason: "Encode HDR video as HEVC Main 10, keeping its HDR signalling.",
-                    videoArguments: HDRVideoArguments.hevcMain10(for: info, intent: intent),
+                    videoArguments: HDRVideoArguments.hevcMain10(for: info, intent: intent,
+                        deinterlaceFilter: deinterlaceFilter),
                     requiresHVC1: true, requiredTransfer: transfer), reason: "HDR \((video ?? "video").uppercased()) needs a 10-bit HEVC copy to keep HDR on Apple TV.")
         }
 

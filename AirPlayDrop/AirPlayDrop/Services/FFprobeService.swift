@@ -91,6 +91,7 @@ struct FFprobeStream: Codable, Equatable, Sendable {
     var height: Int? = nil
     var avg_frame_rate: String? = nil
     var bit_rate: String? = nil
+    var field_order: String? = nil
 
     var isForced: Bool { disposition?["forced"] == 1 }
 }
@@ -255,7 +256,8 @@ enum FFprobeService {
             width: video?.width, height: video?.height,
             averageFrameRate: video?.avg_frame_rate,
             videoBitRate: video.flatMap(streamBitRate),
-            containerBitRate: result.format?.bit_rate.flatMap { Int($0) })
+            containerBitRate: result.format?.bit_rate.flatMap { Int($0) },
+            fieldOrder: video?.field_order)
     }
 
     /// MP4 streams carry `bit_rate`; Matroska files muxed by mkvmerge carry a

@@ -815,6 +815,87 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertEqual(mismatch.reason, "No current artifact manifest")
     }
 
+    private func interlaced(_ codec: String = "h264", width: Int = 1920, height: Int = 1080,
+                            frameRate: String = "25/1", fieldOrder: String = "tt", hdr: Bool = false) -> MediaInfo {
+        var source = video(codec, profile: codec == "h264" ? "High" : nil, pixelFormat: "yuv420p",
+                           width: width, height: height, frameRate: frameRate, hdr: hdr)
+        source.fieldOrder = fieldOrder
+        return source
+    }
+
+    func testProbeMapsInterlacedFieldOrder() throws {
+        // Verbatim FFprobe 9.0.2 fields from a generated top-field-first 1080i25 libx264 clip.
+        let data = #"{"streams":[{"index":0,"codec_name":"h264","profile":"Main","codec_type":"video","width":1920,"height":1080,"pix_fmt":"yuv420p","field_order":"tt","avg_frame_rate":"25/1"}],"format":{"format_name":"mpegts","duration":"2.023222"}}"#.data(using: .utf8)!
+        let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))
+        XCTAssertEqual(mapped.fieldOrder, "tt")
+        XCTAssertTrue(mapped.isInterlaced)
+        XCTAssertEqual(mapped.deinterlacedAverageFrameRate, "50/1")
+        XCTAssertEqual(AppleTVVideoCompatibility.issues(for: mapped), [.interlaced("tt")])
+        XCTAssertEqual(AppleTVVideoCompatibility.reason(for: [.interlaced("tt")]),
+                       "Apple TV cannot play interlaced video streamed over AirPlay.")
+        for order in ["progressive", "unknown"] {
+            let source = interlaced(fieldOrder: order)
+            XCTAssertFalse(source.isInterlaced)
+            XCTAssertEqual(source.deinterlacedAverageFrameRate, "25/1")
+            XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(source))
+        }
+        XCTAssertTrue(interlaced(fieldOrder: "bb").isInterlaced)
+    }
+
+    func testAirPlayPlanDeinterlacesToDoubleRate() throws {
+        let plan = TranscodePlanner.plan(info: interlaced(), intent: .airPlay, selectedAudioID: 2)
+        XCTAssertEqual(plan.reason, "Apple TV cannot play interlaced video streamed over AirPlay.")
+        XCTAssertEqual(plan.steps.map(\.strategy), [.hardwareEncode, .hardwareEncode])
+        // 25i becomes 50p, so the 1080p rate gets the higher-frame-rate increase.
+        XCTAssertEqual(plan.steps[0].videoArguments, ["-vf", "bwdif=mode=send_field:parity=auto:deint=all,format=yuv420p",
+                                                      "-c:v", "h264_videotoolbox", "-b:v", "10400k"])
+        // 29.97i becomes 59.94p, within the 60 fps limit, so there is no -r cap.
+        let ntsc = TranscodePlanner.plan(info: interlaced(frameRate: "30000/1001"), intent: .airPlay, selectedAudioID: 2).steps[0]
+        XCTAssertFalse(ntsc.videoArguments.contains("-r"))
+        XCTAssertEqual(ntsc.videoArguments.last, "11692k")
+        // Interlaced HDR is deinterlaced before the colour tags are set.
+        let hdr = TranscodePlanner.plan(info: interlaced("hevc", hdr: true), intent: .airPlay, selectedAudioID: 2).steps[0]
+        XCTAssertEqual(hdr.videoArguments[1],
+            "bwdif=mode=send_field:parity=auto:deint=all,setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc")
+    }
+
+    func testLocalPlanCopiesInterlacedVideoButDeinterlacesEncodes() {
+        let local = TranscodePlanner.plan(info: interlaced(), intent: .local, selectedAudioID: 2,
+                                          requiresSubtitleMuxing: true).steps
+        XCTAssertEqual(local.first?.videoArguments, ["-c:v", "copy"])
+        XCTAssertTrue(local.last!.videoArguments[1].hasPrefix("bwdif="))
+        // MPEG-2 576i: 414,720 pixels scale the 540p rung, then 50p adds a third.
+        let dvd = TranscodePlanner.plan(info: interlaced("mpeg2video", width: 720, height: 576), intent: .local,
+                                        selectedAudioID: 2).steps[0]
+        XCTAssertEqual(dvd.videoArguments, ["-vf", "bwdif=mode=send_field:parity=auto:deint=all,format=yuv420p",
+                                            "-c:v", "h264_videotoolbox", "-b:v", "2133k"])
+        // Without a deinterlacer the encode still runs, as before.
+        let none = TranscodePlanner.plan(info: interlaced(), intent: .airPlay, selectedAudioID: 2,
+                                         deinterlaceFilter: nil).steps[0]
+        XCTAssertEqual(none.videoArguments[1], "format=yuv420p")
+        XCTAssertFalse(TranscodePlanner.plan(info: video("h264", profile: "High", pixelFormat: "yuv420p"),
+            intent: .local, selectedAudioID: 2, requiresSubtitleMuxing: true).steps.last!.videoArguments[1].contains("bwdif"))
+    }
+
+    func testParseFilterNamesAndChooseDeinterlacer() {
+        let text = """
+        Filters:
+          T.. = Timeline support
+          .S. = Slice threading
+          A = Audio input/output
+          | = Source or sink filter
+         TS bwdif             V->V       Deinterlace the input image.
+         .. setparams         V->V       Force field, or color property for the output video frame.
+         T. acompressor       A->A       Audio compressor.
+        """
+        let names = TranscodeService.parseFilterNames(text)
+        XCTAssertEqual(names, ["bwdif", "setparams", "acompressor"])
+        XCTAssertEqual(TranscodeService.deinterlaceFilter(available: names), Deinterlace.filter)
+        XCTAssertEqual(TranscodeService.deinterlaceFilter(available: ["yadif"]),
+                       "yadif=mode=send_field:parity=auto:deint=all")
+        XCTAssertNil(TranscodeService.deinterlaceFilter(available: ["scale"]))
+    }
+
     func testProbeToleratesUnexpectedSideDataFieldTypes() throws {
         let data = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","side_data_list":[{"side_data_type":7,"rotation":"ninety","dv_profile":"eight"}]}],"format":{"format_name":"mp4","duration":"1.0"}}"#.data(using: .utf8)!
         let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))

@@ -100,6 +100,42 @@ enum TranscodeService {
         }.value
     }
 
+    static func filterNames(using installation: FFmpegInstallation) async -> Set<String> {
+        await Task.detached {
+            let process = Process()
+            let output = Pipe()
+            process.executableURL = installation.ffmpeg
+            process.arguments = ["-hide_banner", "-filters"]
+            process.standardOutput = output
+            process.standardError = FileHandle.nullDevice
+            do { try process.run() } catch { return [] }
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return [] }
+            return parseFilterNames(String(decoding: data, as: UTF8.self))
+        }.value
+    }
+
+    /// Parses `ffmpeg -filters` rows such as ` .. bwdif   V->V   Deinterlace…`.
+    /// Legend rows (`  T.. = Timeline support`) have no `->` column.
+    static func parseFilterNames(_ text: String) -> Set<String> {
+        var names: Set<String> = []
+        for line in text.split(whereSeparator: \.isNewline) {
+            let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard fields.count >= 3, fields[2].contains("->") else { continue }
+            names.insert(String(fields[1]))
+        }
+        return names
+    }
+
+    /// The deinterlacer to use, preferring the bundled `bwdif`. An external
+    /// FFmpeg without it falls back to `yadif`, then to no deinterlacing.
+    static func deinterlaceFilter(available: Set<String>) -> String? {
+        if available.contains("bwdif") { return Deinterlace.filter }
+        if available.contains("yadif") { return "yadif=mode=send_field:parity=auto:deint=all" }
+        return nil
+    }
+
     static func decoderNames(using installation: FFmpegInstallation) async -> Set<String> {
         await codecNames(using: installation, listOption: "-decoders")
     }
@@ -269,11 +305,19 @@ enum TranscodeService {
         }
         let surroundEncoder: SurroundAudioEncoder =
             (await encoderNames(using: installation)).contains("eac3") ? .eac3 : .aac
+        var deinterlacer: String? = Deinterlace.filter
+        if info.isInterlaced {
+            deinterlacer = deinterlaceFilter(available: await filterNames(using: installation))
+            if deinterlacer == nil {
+                logger.warning("FFmpeg has no bwdif or yadif filter; interlaced video is encoded without deinterlacing.")
+            }
+        }
         let plan = TranscodePlanner.plan(info: info, intent: intent, selectedAudioID: selection.audioID,
                                          audioProcessingMode: audioProcessingMode,
                                          syncAdjustment: syncAdjustment,
                                          requiresSubtitleMuxing: selection.hasSelectedSubtitle,
-                                         surroundEncoder: surroundEncoder)
+                                         surroundEncoder: surroundEncoder,
+                                         deinterlaceFilter: deinterlacer)
         if plan.steps.isEmpty {
             return PreparedArtifact(url: input, strategy: .directPlay, reason: plan.reason, isAirPlayPrepared: false)
         }
