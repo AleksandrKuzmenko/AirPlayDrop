@@ -528,6 +528,20 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertEqual(hdr.reason, "Output lost the source's HDR transfer function.")
     }
 
+    func testValidatorRejectsOutputWithoutDolbyVisionSampleEntry() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("plain.mp4")
+        try await writeGeneratedSDRMovie(to: url)
+
+        let result = await MediaArtifactValidator.validate(url, sourceHadAudio: false, requiresDolbyVision: true)
+        XCTAssertFalse(result.isValid)
+        XCTAssertEqual(result.reason, "Output lost its Dolby Vision dvh1 sample entry or configuration.")
+        let flags = await VideoFormatProbe.inspect(AVURLAsset(url: url))
+        XCTAssertTrue(flags.isEmpty)
+    }
+
     /// Writes a 10-frame, 64×64 H.264 movie tagged BT.709 with AVAssetWriter.
     private func writeGeneratedSDRMovie(to url: URL) async throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
@@ -722,6 +736,83 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertEqual(single.reason, "Dolby Vision needs an Apple TV compatible HDR10 fallback.")
         XCTAssertEqual(single.steps[0].videoArguments, remux.videoArguments)
         XCTAssertFalse(info(hdr: true).isDualLayerDolbyVision)
+    }
+
+    private func profile5(format: String = "matroska,webm") -> MediaInfo {
+        var source = info(format: format, hdr: true, dolbyVision: true)
+        source.dolbyVisionProfile = 5
+        source.dolbyVisionCompatibilityID = 0
+        return source
+    }
+
+    func testDolbyVisionProfile5IsKeptAsDolbyVisionWithoutEncodeFallback() {
+        for intent in [PlaybackIntent.airPlay, .local] {
+            let plan = TranscodePlanner.plan(info: profile5(), intent: intent, selectedAudioID: 2)
+            XCTAssertEqual(plan.reason, "Dolby Vision profile 5 has no HDR10 base layer, so it is kept as Dolby Vision in a dvh1 MP4.")
+            // Copy surround first, then retry with encoded audio; never re-encode video.
+            XCTAssertEqual(plan.steps.map(\.strategy), [.dolbyVisionRemux, .dolbyVisionRemux])
+            for step in plan.steps {
+                XCTAssertEqual(step.videoArguments, ["-c:v", "copy", "-tag:v", "dvh1", "-strict", "unofficial"])
+                XCTAssertTrue(step.requiresDolbyVision)
+                XCTAssertFalse(step.requiresHVC1)
+                XCTAssertFalse(step.videoArguments.contains("filter_units=remove_types=62|63"))
+            }
+            XCTAssertEqual(plan.steps[0].audioArguments, ["-c:a", "copy"])
+            XCTAssertEqual(plan.steps[1].audioArguments, ["-c:a", "eac3", "-ac:a", "6", "-b:a", "640k"])
+        }
+        // Late Night still keeps the video as Dolby Vision.
+        let lateNight = TranscodePlanner.plan(info: profile5(), intent: .airPlay, selectedAudioID: 2,
+                                              audioProcessingMode: .lateNight)
+        XCTAssertEqual(lateNight.steps.map(\.strategy), [.dolbyVisionRemux])
+        XCTAssertEqual(lateNight.steps[0].audioArguments, AudioArguments.stereo)
+
+        // Profile 8 and unknown profiles keep the HDR10 base-layer remux.
+        var profile8 = info(hdr: true, dolbyVision: true)
+        profile8.dolbyVisionProfile = 8
+        XCTAssertFalse(profile8.isDolbyVisionProfile5)
+        XCTAssertEqual(TranscodePlanner.plan(info: profile8, intent: .airPlay).steps.first?.strategy, .hdrRemux)
+        XCTAssertEqual(TranscodePlanner.plan(info: info(hdr: true, dolbyVision: true), intent: .airPlay).steps.first?.strategy, .hdrRemux)
+    }
+
+    func testDolbyVisionPassthroughArgumentsKeepStrictForMuxerAndSubtitles() throws {
+        let step = TranscodePlanner.plan(info: profile5(), intent: .airPlay, selectedAudioID: 2).steps[1]
+        var selection = TrackSelection(audioID: 2)
+        selection.subtitle = .embedded(streamID: 3)
+        selection.subtitlePolicy = .includeSelected
+        let args = try TranscodeService.ffmpegArguments(input: URL(fileURLWithPath: "/in.mkv"),
+            output: URL(fileURLWithPath: "/out.mp4"), step: step, selection: selection, sourceHasAudio: true)
+        let strict = try XCTUnwrap(args.firstIndex(of: "-strict"))
+        XCTAssertEqual(args[strict + 1], "unofficial")
+        XCTAssertGreaterThan(strict, try XCTUnwrap(args.firstIndex(of: "-i")))
+        XCTAssertEqual(args[try XCTUnwrap(args.firstIndex(of: "-tag:v")) + 1], "dvh1")
+        XCTAssertTrue(args.contains("mov_text"))
+        XCTAssertEqual(args.last, "/out.mp4")
+    }
+
+    func testCachedCopyMustMatchDolbyVisionRequirement() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("source.mkv")
+        let output = directory.appendingPathComponent("source_airplay.mp4")
+        try Data("source".utf8).write(to: source)
+        try Data("output".utf8).write(to: output)
+        // A copy made before passthrough existed has no Dolby Vision requirement.
+        try MediaArtifactValidator.writeManifest(source: source, artifact: output, sourceHadAudio: true,
+            selectedAudioID: nil, expectedDuration: nil, requiresHVC1: true)
+        let stale = await MediaArtifactValidator.validateCached(output, source: source, expectedDolbyVision: true)
+        XCTAssertEqual(stale.reason, "No current artifact manifest")
+
+        try MediaArtifactValidator.writeManifest(source: source, artifact: output, sourceHadAudio: true,
+            selectedAudioID: nil, expectedDuration: nil, requiresHVC1: false, requiresDolbyVision: true)
+        let manifest = try JSONDecoder().decode(MediaArtifactManifest.self,
+            from: Data(contentsOf: MediaArtifactValidator.manifestURL(for: output)))
+        XCTAssertEqual(manifest.requiresDolbyVision, true)
+        // The manifest now matches, so validation reaches the (unplayable) file itself.
+        let current = await MediaArtifactValidator.validateCached(output, source: source, expectedDolbyVision: true)
+        XCTAssertNotEqual(current.reason, "No current artifact manifest")
+        let mismatch = await MediaArtifactValidator.validateCached(output, source: source)
+        XCTAssertEqual(mismatch.reason, "No current artifact manifest")
     }
 
     func testProbeToleratesUnexpectedSideDataFieldTypes() throws {

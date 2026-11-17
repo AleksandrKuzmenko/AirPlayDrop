@@ -94,7 +94,7 @@ Alternatively, use **FFmpeg Settings** to select a trusted directory containing 
 
 ### Audio plays but video is black on Apple TV
 
-Stop playback and use **Prepare for → Apple TV / AirPlay**. Dolby Vision and some HEVC-in-MKV files need an AirPlay-safe MP4 sample entry or an HDR10-compatible fallback. AirPlayDrop also converts camera and editing formats that the Mac plays but Apple TV cannot decode, such as 10-bit or 4:2:2 H.264 and 4:2:2 HEVC, when playback starts on an AirPlay route.
+Stop playback and use **Prepare for → Apple TV / AirPlay**. Dolby Vision and some HEVC-in-MKV files need an AirPlay-safe MP4 sample entry or an HDR10-compatible fallback. Dolby Vision profile 5 files have no HDR10 fallback and are kept as Dolby Vision instead. AirPlayDrop also converts camera and editing formats that the Mac plays but Apple TV cannot decode, such as 10-bit or 4:2:2 H.264 and 4:2:2 HEVC, when playback starts on an AirPlay route.
 
 ### The wrong audio or subtitle track was selected
 

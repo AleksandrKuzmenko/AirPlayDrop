@@ -296,7 +296,7 @@ enum TranscodeService {
                 try Task.checkCancellation()
                 let validation = await MediaArtifactValidator.validate(reservation.temporary,
                     sourceHadAudio: info.hasAudio, expectedDuration: info.duration, requiresHVC1: step.requiresHVC1,
-                    requiredTransfer: step.requiredTransfer)
+                    requiredTransfer: step.requiredTransfer, requiresDolbyVision: step.requiresDolbyVision)
                 guard validation.isValid else {
                     throw TranscodeError.invalidOutput(validation.reason ?? "Unknown validation error")
                 }
@@ -320,7 +320,7 @@ enum TranscodeService {
                         expectedDuration: info.duration, requiresHVC1: step.requiresHVC1,
                         selectedSubtitle: selection.subtitle, syncAdjustment: syncAdjustment,
                         audioProcessingMode: audioProcessingMode, playbackIntent: intent,
-                        requiredTransfer: step.requiredTransfer)
+                        requiredTransfer: step.requiredTransfer, requiresDolbyVision: step.requiresDolbyVision)
                 } catch {
                     try? FileManager.default.removeItem(at: reservation.destination)
                     throw error

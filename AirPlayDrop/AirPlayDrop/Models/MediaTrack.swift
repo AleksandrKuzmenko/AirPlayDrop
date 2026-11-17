@@ -99,6 +99,12 @@ struct MediaInfo: Codable, Equatable, Sendable {
         isDolbyVision && (dolbyVisionHasEnhancementLayer == true || dolbyVisionProfile == 7)
     }
 
+    /// Profile 5 has no HDR10 or SDR base layer. Its picture is in Dolby's
+    /// IPTPQc2 colour space and only looks right once a Dolby Vision decoder
+    /// applies the RPU, so it must stay Dolby Vision. Only a probed profile 5
+    /// qualifies: an unknown profile keeps the HDR10 base-layer handling.
+    var isDolbyVisionProfile5: Bool { isDolbyVision && dolbyVisionProfile == 5 }
+
     /// The PQ or HLG transfer function when the video signals HDR10 or HLG.
     var hdrTransfer: String? {
         ["smpte2084", "arib-std-b67"].contains(colorTransfer) ? colorTransfer : nil
@@ -220,7 +226,7 @@ enum PlaybackIntent: String, Codable, CaseIterable, Sendable {
 }
 
 enum ConversionStrategy: String, Codable, Sendable {
-    case directPlay, remux, audioTranscode, hdrRemux, hardwareEncode
+    case directPlay, remux, audioTranscode, hdrRemux, dolbyVisionRemux, hardwareEncode
 }
 
 enum AudioProcessingMode: String, Codable, CaseIterable, Sendable {
@@ -277,10 +283,12 @@ struct ConversionStep: Equatable, Sendable {
     /// FFmpeg transfer name (`smpte2084` or `arib-std-b67`) the output must
     /// still signal, so an HDR source never silently becomes an SDR-tagged file.
     let requiredTransfer: String?
+    /// The output must keep a `dvh1` sample entry and Dolby Vision configuration box.
+    let requiresDolbyVision: Bool
 
     init(strategy: ConversionStrategy, reason: String, videoArguments: [String], audioArguments: [String],
          requiresHVC1: Bool, audioProcessingMode: AudioProcessingMode = .standard,
-         requiredTransfer: String? = nil) {
+         requiredTransfer: String? = nil, requiresDolbyVision: Bool = false) {
         self.strategy = strategy
         self.reason = reason
         self.videoArguments = videoArguments
@@ -288,6 +296,7 @@ struct ConversionStep: Equatable, Sendable {
         self.requiresHVC1 = requiresHVC1
         self.audioProcessingMode = audioProcessingMode
         self.requiredTransfer = requiredTransfer
+        self.requiresDolbyVision = requiresDolbyVision
     }
 }
 
@@ -570,6 +579,13 @@ enum AppleTVVideoCompatibility {
     }
 }
 
+enum DolbyVisionArguments {
+    /// Stream-copies Dolby Vision into a `dvh1` sample entry with its RPUs.
+    /// FFmpeg's MP4 muxer writes the `dvcC` configuration box only at
+    /// `-strict unofficial`; without it the output is not valid Dolby Vision.
+    static let passthrough = ["-c:v", "copy", "-tag:v", "dvh1", "-strict", "unofficial"]
+}
+
 struct ConversionPlan: Equatable, Sendable {
     let intent: PlaybackIntent
     let steps: [ConversionStep]
@@ -616,6 +632,22 @@ enum TranscodePlanner {
            ["h264", "hevc"].contains(video),
            [nil, "aac", "ac3", "eac3"].contains(audio) {
             return ConversionPlan(intent: intent, steps: [], reason: "The source is already compatible with local playback.")
+        }
+
+        // Stripping the RPU, or re-encoding decoded frames (the bundled FFmpeg
+        // cannot apply the RPU), would bake in wrong colours. Profile 5 is kept
+        // as Dolby Vision, which Apple TV and macOS decode, with no encode
+        // fallback: if the copy is rejected, preparation fails with its reason.
+        if info.isDolbyVisionProfile5, video == "hevc" {
+            var audioVariants = [preferredAudio]
+            if preferredAudio != encodedAudio { audioVariants.append(encodedAudio) }
+            let reason = "Dolby Vision profile 5 has no HDR10 base layer, so it is kept as Dolby Vision in a dvh1 MP4."
+            return ConversionPlan(intent: intent, steps: audioVariants.map {
+                ConversionStep(strategy: .dolbyVisionRemux, reason: reason,
+                    videoArguments: DolbyVisionArguments.passthrough, audioArguments: $0, requiresHVC1: false,
+                    audioProcessingMode: audioProcessingMode, requiredTransfer: info.hdrTransfer,
+                    requiresDolbyVision: true)
+            }, reason: reason)
         }
 
         if intent == .airPlay, video == "hevc", info.isHDR {

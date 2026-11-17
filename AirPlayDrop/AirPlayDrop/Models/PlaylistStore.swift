@@ -233,7 +233,8 @@ final class PlaylistStore {
                         expectedSelection: item.trackSelection,
                         expectedSyncAdjustment: item.syncAdjustment,
                         expectedAudioProcessingMode: item.audioProcessingMode,
-                        expectedIntent: intent)
+                        expectedIntent: intent,
+                        expectedDolbyVision: plan.steps.contains(where: \.requiresDolbyVision))
                     guard self.isCurrent(token, for: item), !Task.isCancelled else { return }
                     if validation.isValid { cachedURL = candidate; break }
                 }
