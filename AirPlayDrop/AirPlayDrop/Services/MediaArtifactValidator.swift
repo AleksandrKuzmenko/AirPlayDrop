@@ -30,6 +30,8 @@ struct MediaArtifactManifest: Codable, Sendable {
     let appleTVRulesVersion: Int?
     /// Absent in manifests written before Dolby Vision passthrough existed.
     let requiresDolbyVision: Bool?
+    /// Receiver an AirPlay copy was prepared for; absent means Apple TV 4K.
+    let airPlayReceiver: AirPlayReceiver?
 }
 
 enum MediaArtifactError: LocalizedError {
@@ -63,7 +65,8 @@ enum MediaArtifactValidator {
                               audioProcessingPresetVersion: Int = AudioProcessingPreset.version,
                               playbackIntent: PlaybackIntent = .local,
                               requiredTransfer: String? = nil,
-                              requiresDolbyVision: Bool = false) throws {
+                              requiresDolbyVision: Bool = false,
+                              airPlayReceiver: AirPlayReceiver? = nil) throws {
         guard let fingerprint = sourceFingerprint(source) else { throw MediaArtifactError.missingFingerprint }
         guard let outputValues = try? artifact.resourceValues(forKeys: [.fileSizeKey]),
               let outputSize = outputValues.fileSize else { throw MediaArtifactError.missingOutputSize }
@@ -76,7 +79,8 @@ enum MediaArtifactValidator {
             audioProcessingPresetVersion: audioProcessingPresetVersion,
             playbackIntent: playbackIntent, requiredTransfer: requiredTransfer,
             appleTVRulesVersion: playbackIntent == .airPlay ? AppleTVVideoCompatibility.rulesVersion : nil,
-            requiresDolbyVision: requiresDolbyVision)
+            requiresDolbyVision: requiresDolbyVision,
+            airPlayReceiver: playbackIntent == .airPlay ? (airPlayReceiver ?? .appleTV4K) : nil)
         let data = try JSONEncoder().encode(manifest)
         try data.write(to: manifestURL(for: artifact), options: .atomic)
     }
@@ -87,7 +91,8 @@ enum MediaArtifactValidator {
                                expectedSyncAdjustment: SyncAdjustment = .zero,
                                expectedAudioProcessingMode: AudioProcessingMode = .standard,
                                expectedIntent: PlaybackIntent = .local,
-                               expectedDolbyVision: Bool = false) async -> MediaArtifactValidation {
+                               expectedDolbyVision: Bool = false,
+                               expectedReceiver: AirPlayReceiver = .appleTV4K) async -> MediaArtifactValidation {
         guard let data = try? Data(contentsOf: manifestURL(for: artifact)),
               let manifest = try? JSONDecoder().decode(MediaArtifactManifest.self, from: data),
               manifest.schemaVersion == 6,
@@ -104,6 +109,7 @@ enum MediaArtifactValidator {
               expectedIntent != .airPlay || manifest.appleTVRulesVersion == AppleTVVideoCompatibility.rulesVersion,
               // Copies of profile 5 sources made before passthrough lost their Dolby Vision data.
               (manifest.requiresDolbyVision ?? false) == expectedDolbyVision,
+              expectedIntent != .airPlay || (manifest.airPlayReceiver ?? .appleTV4K) == expectedReceiver,
               (manifest.selectedSubtitle.externalDescriptor == nil || manifest.selectedSubtitle.externalDescriptor?.isCurrent == true),
               let outputValues = try? artifact.resourceValues(forKeys: [.fileSizeKey]),
               Int64(outputValues.fileSize ?? -1) == manifest.outputSize else {

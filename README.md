@@ -14,6 +14,7 @@ The project is currently a **0.1.x alpha**. The release process produces an arm6
 - Automatic discovery and manual attachment of external `.srt`, `.vtt`, `.ass`, and `.ssa` subtitles.
 - Per-file audio and subtitle synchronization adjustment from -10 to +10 seconds.
 - Apple TV video checks: video the Mac plays but Apple TV cannot decode, such as 10-bit or 4:2:2 H.264, 4:2:2 HEVC, AV1, video above 2160p or 60 fps, or interlaced video, is converted before AirPlay playback instead of streamed as-is. Interlaced video is deinterlaced to full frame rate whenever it is encoded.
+- AirPlay receiver setting: choose **Apple TV HD or SDR-only receiver** in Playback Settings to prepare 1080p SDR H.264 for receivers without HEVC or HDR. HDR video is then tone-mapped to SDR with Apple's VideoToolbox. The default, **Apple TV 4K or HDR receiver**, keeps HDR; an Apple TV 4K converts HDR for SDR televisions itself.
 - Surround audio preserved for Apple TV: AAC, AC3, and E-AC3 tracks are copied unchanged, and other multichannel audio is converted to E-AC3 up to 5.1.
 - Optional Late Night audio processing for quieter peaks and clearer dialogue.
 - Resume playback for unfinished videos and timeline thumbnail previews while scrubbing.

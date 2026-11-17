@@ -220,13 +220,15 @@ final class PlaylistStore {
                                                                           preferences: self.preferencesStore.preferences)
                     item.hasAppliedInitialSelection = true
                 }
+                let receiver = self.preferencesStore.preferences.airPlayReceiver
                 let plan = TranscodePlanner.plan(info: info, intent: intent,
                     selectedAudioID: item.trackSelection.audioID,
                     audioProcessingMode: item.audioProcessingMode,
                     syncAdjustment: item.syncAdjustment,
                     requiresSubtitleMuxing: item.trackSelection.hasSelectedSubtitle,
                     burnInSubtitle: SubtitleBurnIn.selected(in: info, selection: item.trackSelection,
-                                                            syncAdjustment: item.syncAdjustment))
+                                                            syncAdjustment: item.syncAdjustment),
+                    receiver: receiver)
                 item.preparationReason = plan.reason
 
                 var cachedURL: URL?
@@ -236,14 +238,16 @@ final class PlaylistStore {
                         expectedSyncAdjustment: item.syncAdjustment,
                         expectedAudioProcessingMode: item.audioProcessingMode,
                         expectedIntent: intent,
-                        expectedDolbyVision: plan.steps.contains(where: \.requiresDolbyVision))
+                        expectedDolbyVision: plan.steps.contains(where: \.requiresDolbyVision),
+                        expectedReceiver: receiver)
                     guard self.isCurrent(token, for: item), !Task.isCancelled else { return }
                     if validation.isValid { cachedURL = candidate; break }
                 }
                 if let cachedURL {
                     let probed = try? await FFprobeService.probe(cachedURL, using: installation)
                     guard self.isCurrent(token, for: item), !Task.isCancelled else { return }
-                    item.preparedCopyCompatibility = probed.map { (cachedURL, AppleTVVideoCompatibility.isCompatible($0)) }
+                    item.preparedCopyInfo = probed.map { (cachedURL, $0) }
+                    item.preparedReceiver = intent == .airPlay ? receiver : nil
                     item.transcodedURL = cachedURL
                     item.isAirPlayPrepared = intent == .airPlay
                     item.preparationReason = "Reused a validated prepared copy."
@@ -254,7 +258,8 @@ final class PlaylistStore {
                     let artifact = try await TranscodeService.prepare(input: item.fileURL, info: info,
                         selection: item.trackSelection, intent: intent,
                         syncAdjustment: item.syncAdjustment,
-                        audioProcessingMode: item.audioProcessingMode) { progress in
+                        audioProcessingMode: item.audioProcessingMode,
+                        receiver: receiver) { progress in
                             Task { @MainActor in
                                 guard progressStore.isCurrent(token, for: progressItem) else { return }
                                 if case .transcoding(let old) = progressItem.state {
@@ -264,7 +269,8 @@ final class PlaylistStore {
                         }
                     guard self.isCurrent(token, for: item), !Task.isCancelled else { return }
                     item.transcodedURL = artifact.url == item.fileURL ? nil : artifact.url
-                    item.preparedCopyCompatibility = artifact.isAppleTVCompatible.map { (artifact.url, $0) }
+                    item.preparedCopyInfo = artifact.outputInfo.map { (artifact.url, $0) }
+                    item.preparedReceiver = intent == .airPlay ? receiver : nil
                     item.isAirPlayPrepared = artifact.isAirPlayPrepared
                     item.preparationReason = artifact.reason
                     item.state = .ready

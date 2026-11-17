@@ -27,6 +27,8 @@ final class PlaybackController {
     var onPlaybackFailure: ((MediaItem) -> Void)?
     var onVideoRenderFailure: ((MediaItem) -> Void)?
     var onAirPlayCompatibilityRequired: ((MediaItem) -> Void)?
+    /// The AirPlay receiver chosen in Settings, read when playback starts.
+    var airPlayReceiver: () -> AirPlayReceiver = { PlaybackPreferencesStore().preferences.airPlayReceiver }
     var onEnded: (() -> Void)?
 
     private let historyStore: PlaybackHistoryStoring
@@ -163,7 +165,7 @@ final class PlaybackController {
         guard let item = loadedItem, item.state == .ready else { return }
         playbackRequested = true
         if resumeProposal != nil { return }
-        if isExternalPlaybackActive, item.needsAirPlayTranscode {
+        if isExternalPlaybackActive, item.needsAirPlayTranscode(for: airPlayReceiver()) {
             requestAirPlayConversionIfNeeded()
             return
         }
@@ -197,7 +199,7 @@ final class PlaybackController {
     private func requestAirPlayConversionIfNeeded() {
         guard let item = loadedItem,
               item.state == .ready,
-              item.needsAirPlayTranscode else { return }
+              item.needsAirPlayTranscode(for: airPlayReceiver()) else { return }
 
         logger.notice("AirPlay conversion required for '\(item.displayName)'")
         persistHistory(force: true)

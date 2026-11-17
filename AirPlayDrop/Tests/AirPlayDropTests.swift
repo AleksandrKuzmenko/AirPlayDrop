@@ -72,17 +72,17 @@ final class AirPlayDropTests: XCTestCase {
         item.isAirPlayPrepared = false
         XCTAssertTrue(item.formatFlags.isEmpty)
         XCTAssertEqual(item.effectiveFormatFlags, [.dolbyVision, .hdr10])
-        XCTAssertTrue(item.needsAirPlayTranscode)
+        XCTAssertTrue(item.needsAirPlayTranscode(for: .appleTV4K))
         XCTAssertEqual(item.formatTag, "DV")
 
         item.isAirPlayPrepared = true
-        XCTAssertFalse(item.needsAirPlayTranscode)
+        XCTAssertFalse(item.needsAirPlayTranscode(for: .appleTV4K))
     }
 
     func testSDRInfoDoesNotTriggerAirPlayPreparation() {
         let item = MediaItem(fileURL: URL(fileURLWithPath: "/tmp/Movie.mkv"))
         item.mediaInfo = info(hdr: false)
-        XCTAssertFalse(item.needsAirPlayTranscode)
+        XCTAssertFalse(item.needsAirPlayTranscode(for: .appleTV4K))
         XCTAssertNil(item.formatTag)
     }
 
@@ -351,29 +351,29 @@ final class AirPlayDropTests: XCTestCase {
         let item = MediaItem(fileURL: URL(fileURLWithPath: "/tmp/Camera.mov"))
         item.mediaInfo = video("hevc", profile: "Rext", pixelFormat: "yuv422p10le")
         item.isAirPlayPrepared = true
-        XCTAssertTrue(item.needsAirPlayTranscode)
+        XCTAssertTrue(item.needsAirPlayTranscode(for: .appleTV4K))
 
         // An unprobed local copy is judged by its source.
         let local = URL(fileURLWithPath: "/tmp/Camera_local.mp4")
         item.transcodedURL = local
         item.playbackIntent = .local
-        XCTAssertTrue(item.needsAirPlayTranscode)
+        XCTAssertTrue(item.needsAirPlayTranscode(for: .appleTV4K))
         // A local H.264 encode that probed compatible streams as it is.
-        item.preparedCopyCompatibility = (local, true)
-        XCTAssertFalse(item.needsAirPlayTranscode)
-        item.preparedCopyCompatibility = (local, false)
-        XCTAssertTrue(item.needsAirPlayTranscode)
+        item.preparedCopyInfo = (local, video("h264", profile: "High", pixelFormat: "yuv420p"))
+        XCTAssertFalse(item.needsAirPlayTranscode(for: .appleTV4K))
+        item.preparedCopyInfo = (local, video("hevc", profile: "Rext", pixelFormat: "yuv422p10le"))
+        XCTAssertTrue(item.needsAirPlayTranscode(for: .appleTV4K))
         // A probe result for a different copy does not apply.
-        item.preparedCopyCompatibility = (URL(fileURLWithPath: "/tmp/Other.mp4"), true)
-        XCTAssertTrue(item.needsAirPlayTranscode)
+        item.preparedCopyInfo = (URL(fileURLWithPath: "/tmp/Other.mp4"), video("h264", profile: "High", pixelFormat: "yuv420p"))
+        XCTAssertTrue(item.needsAirPlayTranscode(for: .appleTV4K))
 
         item.transcodedURL = URL(fileURLWithPath: "/tmp/Camera_airplay.mp4")
         item.playbackIntent = .airPlay
-        XCTAssertFalse(item.needsAirPlayTranscode)
+        XCTAssertFalse(item.needsAirPlayTranscode(for: .appleTV4K))
 
         let compatible = MediaItem(fileURL: URL(fileURLWithPath: "/tmp/Clip.mp4"))
         compatible.mediaInfo = video("h264", profile: "High", pixelFormat: "yuv420p")
-        XCTAssertFalse(compatible.needsAirPlayTranscode)
+        XCTAssertFalse(compatible.needsAirPlayTranscode(for: .appleTV4K))
     }
 
     private func hdrBitRate(width: Int?, height: Int?, frameRate: String?, source: Int? = nil,
@@ -989,6 +989,116 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertFalse(args.contains("mov_text"))
         XCTAssertFalse(args.contains("-bsf:s"))
         XCTAssertEqual(Array(args.suffix(3)), ["-movflags", "+faststart", "/out.mp4"])
+    }
+
+    private let toneMapChain = "format=p010le,hwupload,scale_vt=color_matrix=bt709:color_primaries=bt709:color_transfer=bt709,hwdownload,format=p010le"
+
+    func testSDRReceiverRulesAcceptOnly1080pSDRH264() {
+        let receiver = AirPlayReceiver.sdrH264
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("h264", profile: "High", pixelFormat: "yuv420p"),
+                                                             receiver: receiver))
+        XCTAssertEqual(AppleTVVideoCompatibility.issues(for: video("hevc", profile: "Main", pixelFormat: "yuv420p"),
+                                                        receiver: receiver), [.codec("hevc")])
+        XCTAssertEqual(AppleTVVideoCompatibility.issues(for: video("h264", profile: "High", pixelFormat: "yuv420p",
+            width: 3840, height: 2160), receiver: receiver), [.resolution(width: 3840, height: 2160)])
+        XCTAssertEqual(AppleTVVideoCompatibility.issues(for: video("h264", profile: "High", pixelFormat: "yuv420p",
+            hdr: true), receiver: receiver), [.hdr])
+        XCTAssertEqual(AppleTVVideoCompatibility.reason(for: [.hdr], receiver: receiver),
+                       "The SDR AirPlay receiver cannot play HDR video streamed over AirPlay.")
+        // The Apple TV 4K rules are unchanged.
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("hevc", profile: "Main 10",
+            pixelFormat: "yuv420p10le", width: 3840, height: 2160, hdr: true)))
+    }
+
+    func testSDRReceiverPlanToneMapsHDRToH264At1080p() {
+        let hdr4K = MediaInfo(formatName: "matroska,webm", duration: 120, videoCodec: "hevc", videoProfile: "Main 10",
+            pixelFormat: "yuv420p10le", colorTransfer: "smpte2084", isDolbyVision: false,
+            tracks: [audioTrack("eac3", channels: 6)], width: 3840, height: 2160, averageFrameRate: "24000/1001")
+        let plan = TranscodePlanner.plan(info: hdr4K, intent: .airPlay, selectedAudioID: 2, receiver: .sdrH264)
+        XCTAssertEqual(plan.reason, "The SDR AirPlay receiver cannot play HEVC video, 3840×2160 resolution, HDR video streamed over AirPlay.")
+        XCTAssertEqual(plan.steps.map(\.strategy), [.hardwareEncode, .hardwareEncode])
+        XCTAssertEqual(plan.steps[0].videoArguments, ["-vf",
+            toneMapChain + ",scale=w=1920:h=1080:force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p",
+            "-c:v", "h264_videotoolbox", "-b:v", "7800k"])
+        XCTAssertNil(plan.steps[0].requiredTransfer)
+        XCTAssertEqual(plan.steps[0].audioArguments, ["-c:a", "copy"])
+        // The same source for an Apple TV 4K keeps HDR with the lossless remux first.
+        XCTAssertEqual(TranscodePlanner.plan(info: hdr4K, intent: .airPlay, selectedAudioID: 2).steps.first?.strategy, .hdrRemux)
+        // Local playback ignores the receiver.
+        XCTAssertEqual(TranscodePlanner.plan(info: hdr4K, intent: .local, selectedAudioID: 2, receiver: .sdrH264),
+                       TranscodePlanner.plan(info: hdr4K, intent: .local, selectedAudioID: 2))
+    }
+
+    func testLocalH264FallbackToneMapsHDR() {
+        let hdr = MediaInfo(formatName: "matroska,webm", duration: 120, videoCodec: "hevc", videoProfile: "Main 10",
+            pixelFormat: "yuv420p10le", colorTransfer: "arib-std-b67", isDolbyVision: false,
+            tracks: [audioTrack("aac", channels: 2)], width: 1920, height: 1080, averageFrameRate: "25/1")
+        let last = TranscodePlanner.plan(info: hdr, intent: .local, selectedAudioID: 2,
+                                         requiresSubtitleMuxing: true).steps.last!
+        XCTAssertEqual(last.videoArguments.prefix(2), ["-vf", toneMapChain + ",format=yuv420p"])
+        XCTAssertEqual(ToneMap.inputArguments(for: last), ["-init_hw_device", "videotoolbox=vt", "-filter_hw_device", "vt"])
+        let remux = TranscodePlanner.plan(info: hdr, intent: .local, selectedAudioID: 2,
+                                          requiresSubtitleMuxing: true).steps.first!
+        XCTAssertEqual(remux.strategy, .remux)
+        XCTAssertEqual(ToneMap.inputArguments(for: remux), [])
+        // Without the filters the old untagged fallback remains.
+        let untoned = TranscodePlanner.plan(info: hdr, intent: .local, selectedAudioID: 2,
+                                            requiresSubtitleMuxing: true, canToneMap: false).steps.last!
+        XCTAssertEqual(untoned.videoArguments.prefix(2), ["-vf", "format=yuv420p"])
+        // Burned-in subtitles go on after tone mapping, so they are not dimmed.
+        let burned = TranscodePlanner.plan(info: withPGS(hdr), intent: .airPlay, selectedAudioID: 2,
+            burnInSubtitle: SubtitleBurnIn(streamID: 3), receiver: .sdrH264).steps[0]
+        XCTAssertEqual(burned.videoArguments[1], "[0:v:0]" + toneMapChain + "[base];[1:3]null[sub];"
+            + "[base][sub]overlay=x=(W-w)/2:y=H-h:eof_action=pass:format=auto,format=yuv420p[v]")
+    }
+
+    func testAirPlayCopyIsTiedToItsReceiver() {
+        let item = MediaItem(fileURL: URL(fileURLWithPath: "/tmp/HDR.mkv"))
+        item.mediaInfo = info(hdr: true)
+        XCTAssertTrue(item.needsAirPlayTranscode(for: .appleTV4K))
+        XCTAssertTrue(item.needsAirPlayTranscode(for: .sdrH264))
+        let copy = URL(fileURLWithPath: "/tmp/HDR_airplay.mp4")
+        item.transcodedURL = copy
+        item.playbackIntent = .airPlay
+        item.isAirPlayPrepared = true
+        item.preparedReceiver = .appleTV4K
+        item.preparedCopyInfo = (copy, info(format: "mov,mp4,m4a,3gp,3g2,mj2", hdr: true))
+        XCTAssertFalse(item.needsAirPlayTranscode(for: .appleTV4K))
+        // An HDR copy made for an Apple TV 4K must be prepared again for an SDR receiver.
+        XCTAssertTrue(item.needsAirPlayTranscode(for: .sdrH264))
+        item.preparedReceiver = .sdrH264
+        item.preparedCopyInfo = (copy, video("h264", profile: "High", pixelFormat: "yuv420p"))
+        XCTAssertFalse(item.needsAirPlayTranscode(for: .sdrH264))
+    }
+
+    func testAirPlayReceiverPreferenceAndManifest() async throws {
+        var preferences = PlaybackPreferences()
+        XCTAssertEqual(preferences.airPlayReceiver, .appleTV4K)
+        preferences.airPlayReceiver = .sdrH264
+        let decoded = try JSONDecoder().decode(PlaybackPreferences.self, from: JSONEncoder().encode(preferences))
+        XCTAssertEqual(decoded.airPlayReceiver, .sdrH264)
+        let legacy = try JSONDecoder().decode(PlaybackPreferences.self,
+            from: Data(#"{"schemaVersion":1,"preferredAudioLanguages":["en"],"subtitleDefaultMode":"off"}"#.utf8))
+        XCTAssertEqual(legacy.airPlayReceiver, .appleTV4K)
+
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("source.mkv")
+        let output = directory.appendingPathComponent("source_airplay.mp4")
+        try Data("source".utf8).write(to: source)
+        try Data("output".utf8).write(to: output)
+        try MediaArtifactValidator.writeManifest(source: source, artifact: output, sourceHadAudio: true,
+            selectedAudioID: nil, expectedDuration: nil, requiresHVC1: false, playbackIntent: .airPlay,
+            airPlayReceiver: .sdrH264)
+        let manifest = try JSONDecoder().decode(MediaArtifactManifest.self,
+            from: Data(contentsOf: MediaArtifactValidator.manifestURL(for: output)))
+        XCTAssertEqual(manifest.airPlayReceiver, .sdrH264)
+        let wrongReceiver = await MediaArtifactValidator.validateCached(output, source: source, expectedIntent: .airPlay)
+        XCTAssertEqual(wrongReceiver.reason, "No current artifact manifest")
+        let sameReceiver = await MediaArtifactValidator.validateCached(output, source: source, expectedIntent: .airPlay,
+                                                                       expectedReceiver: .sdrH264)
+        XCTAssertNotEqual(sameReceiver.reason, "No current artifact manifest")
     }
 
     func testProbeToleratesUnexpectedSideDataFieldTypes() throws {

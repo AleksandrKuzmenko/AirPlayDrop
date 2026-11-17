@@ -378,7 +378,7 @@ enum HDRVideoArguments {
                                         : (filters: [], output: [])
         return VideoFilterGraph.arguments(pre: Deinterlace.filters(for: info, filter: deinterlaceFilter),
                                           post: limits.filters + [colorFilter(for: info)].compactMap { $0 },
-                                          burnIn: burnIn, info: info)
+                                          burnIn: burnIn, info: info, outputIsHDR: true)
             + limits.output
             + ["-c:v", "hevc_videotoolbox", "-profile:v", "main10", "-pix_fmt", "p010le",
                "-b:v", "\(VideoBitRate.kilobits(for: info, intent: intent, target: .hevcHDR))k", "-tag:v", "hvc1"]
@@ -444,7 +444,8 @@ enum VideoFilterGraph {
     static let outputLabel = "[v]"
     static let subtitleInput = 1
 
-    static func arguments(pre: [String], post: [String], burnIn: SubtitleBurnIn?, info: MediaInfo) -> [String] {
+    static func arguments(pre: [String], post: [String], burnIn: SubtitleBurnIn?, info: MediaInfo,
+                          outputIsHDR: Bool) -> [String] {
         guard let burnIn else {
             let filters = pre + post
             return filters.isEmpty ? [] : ["-vf", filters.joined(separator: ",")]
@@ -453,7 +454,7 @@ enum VideoFilterGraph {
         if burnIn.offsetSeconds != 0 {
             subtitle.append("setpts=PTS+\(String(format: "%.3f", burnIn.offsetSeconds))/TB")
         }
-        if let scale = SubtitleBurnIn.hdrGraphicsScale(for: info.hdrTransfer) {
+        if outputIsHDR, let scale = SubtitleBurnIn.hdrGraphicsScale(for: info.hdrTransfer) {
             subtitle.append("colorchannelmixer=rr=\(scale):gg=\(scale):bb=\(scale)")
         }
         let base = "[0:v:0]" + (pre.isEmpty ? "null" : pre.joined(separator: ",")) + "[base]"
@@ -516,8 +517,9 @@ enum VideoBitRate {
     static let minimumKilobits = 500
     static let efficientSourceCodecs: Set<String> = ["hevc", "vp9", "av1"]
 
-    static func kilobits(for info: MediaInfo, intent: PlaybackIntent, target: Target) -> Int {
-        let pixels = outputPixels(for: info, intent: intent)
+    static func kilobits(for info: MediaInfo, intent: PlaybackIntent, target: Target,
+                         receiver: AirPlayReceiver = .appleTV4K) -> Int {
+        let pixels = outputPixels(for: info, intent: intent, receiver: receiver)
         let ladder = target == .h264 ? h264Ladder : hdrLadder
         var rate = Double(baseKilobits(forPixels: pixels, ladder: ladder))
             * frameRateFactor(outputFrameRate(for: info, intent: intent), target: target)
@@ -557,13 +559,14 @@ enum VideoBitRate {
 
     /// Output pixels after any AirPlay downscale. Unknown sizes use 2160p
     /// so quality is not reduced by a missing probe field.
-    static func outputPixels(for info: MediaInfo, intent: PlaybackIntent) -> Int {
+    static func outputPixels(for info: MediaInfo, intent: PlaybackIntent,
+                             receiver: AirPlayReceiver = .appleTV4K) -> Int {
         guard let width = info.width, let height = info.height, width > 0, height > 0 else {
             return 3840 * 2160
         }
         guard intent == .airPlay else { return width * height }
-        let scale = min(1, Double(AppleTVVideoCompatibility.maxLongSide) / Double(max(width, height)),
-                        Double(AppleTVVideoCompatibility.maxShortSide) / Double(min(width, height)))
+        let scale = min(1, Double(receiver.maxLongSide) / Double(max(width, height)),
+                        Double(receiver.maxShortSide) / Double(min(width, height)))
         return Int((Double(width) * scale).rounded()) * Int((Double(height) * scale).rounded())
     }
 
@@ -573,6 +576,51 @@ enum VideoBitRate {
         let rate = Double(numerator) / Double(denominator)
         guard intent == .airPlay, rate > AppleTVVideoCompatibility.frameRateLimit else { return rate }
         return rate / (rate / AppleTVVideoCompatibility.frameRateLimit).rounded(.up)
+    }
+}
+
+/// The AirPlay receiver video is prepared for. macOS cannot tell which
+/// receiver an AirPlay route leads to, so this is a user setting.
+enum AirPlayReceiver: String, Codable, CaseIterable, Sendable {
+    /// Apple TV 4K or another receiver that decodes HEVC and HDR. An Apple TV
+    /// 4K converts HDR itself for SDR televisions.
+    case appleTV4K
+    /// Apple TV HD or another receiver limited to SDR H.264. Apple's Apple TV
+    /// HD specifications list H.264 "up to 1080p, 60 fps", and HEVC only as
+    /// SDR up to 1080p at 30 fps, so this profile accepts H.264 SDR only.
+    case sdrH264
+
+    var label: String {
+        switch self {
+        case .appleTV4K: return "Apple TV 4K or HDR receiver"
+        case .sdrH264: return "Apple TV HD or SDR-only receiver"
+        }
+    }
+
+    var maxLongSide: Int { self == .appleTV4K ? 4096 : 1920 }
+    var maxShortSide: Int { self == .appleTV4K ? 2160 : 1080 }
+    var acceptsHDR: Bool { self == .appleTV4K }
+    var codecs: Set<String> { self == .appleTV4K ? ["h264", "hevc"] : ["h264"] }
+}
+
+/// HDR to SDR conversion for 8-bit H.264 encodes.
+///
+/// VideoToolbox's pixel transfer session (FFmpeg's `scale_vt`) converts PQ
+/// and HLG to BT.709 with Apple's tone mapping, compressing highlights rather
+/// than clipping them. It needs the frames on a VideoToolbox device, so the
+/// chain uploads and downloads them, and the encode adds `inputArguments`.
+enum ToneMap {
+    static let filters = ["format=p010le", "hwupload",
+                          "scale_vt=color_matrix=bt709:color_primaries=bt709:color_transfer=bt709",
+                          "hwdownload", "format=p010le"]
+    static let inputArguments = ["-init_hw_device", "videotoolbox=vt", "-filter_hw_device", "vt"]
+    static let requiredFilters = ["hwupload", "scale_vt", "hwdownload"]
+
+    static func isNeeded(for info: MediaInfo) -> Bool { info.hdrTransfer != nil }
+
+    /// Device arguments for a step whose filters tone-map; copy steps get none.
+    static func inputArguments(for step: ConversionStep) -> [String] {
+        step.videoArguments.contains { $0.contains("scale_vt") } ? inputArguments : []
     }
 }
 
@@ -600,8 +648,6 @@ enum AppleTVVideoCompatibility {
     /// Vision profile 7 enhancement layer that version 1 copies kept; version 3
     /// deinterlaces video that earlier versions copied.
     static let rulesVersion = 3
-    static let maxLongSide = 4096
-    static let maxShortSide = 2160
     static let maxFrameRate = 60.0
     /// Variable-frame-rate phone and screen recordings nominally at 60 fps
     /// often probe slightly above it.
@@ -625,6 +671,7 @@ enum AppleTVVideoCompatibility {
         case resolution(width: Int, height: Int)
         case frameRate(Double)
         case interlaced(String)
+        case hdr
 
         var description: String {
             switch self {
@@ -634,23 +681,26 @@ enum AppleTVVideoCompatibility {
             case .resolution(let width, let height): return "\(width)×\(height) resolution"
             case .frameRate(let rate): return "\(String(format: "%.4g", rate)) fps"
             case .interlaced: return "interlaced video"
+            case .hdr: return "HDR video"
             }
         }
     }
 
-    static func issues(for info: MediaInfo) -> [Issue] {
+    static func issues(for info: MediaInfo, receiver: AirPlayReceiver = .appleTV4K) -> [Issue] {
         guard let codec = info.videoCodec?.lowercased() else { return [] }
         guard let blockedProfiles = unsupportedProfiles[codec], let allowedFormats = pixelFormats[codec] else {
             return [.codec(codec)]
         }
-        var issues: [Issue] = []
+        // A known codec the receiver lacks (HEVC on an SDR receiver) still
+        // reports its other issues, so the reason names everything converted.
+        var issues: [Issue] = receiver.codecs.contains(codec) ? [] : [.codec(codec)]
         if let profile = info.videoProfile, blockedProfiles.contains(profile) {
             issues.append(.profile(profile))
         }
         if let format = info.pixelFormat, !allowedFormats.contains(format) {
             issues.append(.pixelFormat(format))
         }
-        if exceedsResolution(info), let width = info.width, let height = info.height {
+        if exceedsResolution(info, receiver: receiver), let width = info.width, let height = info.height {
             issues.append(.resolution(width: width, height: height))
         }
         if let rate = info.frameRate, rate > frameRateLimit {
@@ -659,20 +709,28 @@ enum AppleTVVideoCompatibility {
         if info.isInterlaced, let order = info.fieldOrder {
             issues.append(.interlaced(order))
         }
+        if !receiver.acceptsHDR, info.isHDR {
+            issues.append(.hdr)
+        }
         return issues
     }
 
-    static func isCompatible(_ info: MediaInfo) -> Bool { issues(for: info).isEmpty }
+    static func isCompatible(_ info: MediaInfo, receiver: AirPlayReceiver = .appleTV4K) -> Bool {
+        issues(for: info, receiver: receiver).isEmpty
+    }
 
-    static func reason(for issues: [Issue]) -> String {
-        "Apple TV cannot play " + issues.map(\.description).joined(separator: ", ") + " streamed over AirPlay."
+    static func reason(for issues: [Issue], receiver: AirPlayReceiver = .appleTV4K) -> String {
+        (receiver == .appleTV4K ? "Apple TV" : "The SDR AirPlay receiver") + " cannot play "
+            + issues.map(\.description).joined(separator: ", ") + " streamed over AirPlay."
     }
 
     /// Filters and output options that bring an encode within Apple TV limits.
-    static func conformingArguments(for info: MediaInfo) -> (filters: [String], output: [String]) {
+    static func conformingArguments(for info: MediaInfo, receiver: AirPlayReceiver = .appleTV4K)
+        -> (filters: [String], output: [String]) {
         var filters: [String] = []
-        if exceedsResolution(info), let width = info.width, let height = info.height {
-            let (w, h) = width >= height ? (maxLongSide, maxShortSide) : (maxShortSide, maxLongSide)
+        if exceedsResolution(info, receiver: receiver), let width = info.width, let height = info.height {
+            let (w, h) = width >= height ? (receiver.maxLongSide, receiver.maxShortSide)
+                                         : (receiver.maxShortSide, receiver.maxLongSide)
             filters.append("scale=w=\(w):h=\(h):force_original_aspect_ratio=decrease:force_divisible_by=2")
         }
         var output: [String] = []
@@ -692,9 +750,9 @@ enum AppleTVVideoCompatibility {
         return (numerator, denominator)
     }
 
-    private static func exceedsResolution(_ info: MediaInfo) -> Bool {
+    private static func exceedsResolution(_ info: MediaInfo, receiver: AirPlayReceiver) -> Bool {
         guard let width = info.width, let height = info.height else { return false }
-        return max(width, height) > maxLongSide || min(width, height) > maxShortSide
+        return max(width, height) > receiver.maxLongSide || min(width, height) > receiver.maxShortSide
     }
 }
 
@@ -718,11 +776,14 @@ enum TranscodePlanner {
                      requiresSubtitleMuxing: Bool = false,
                      surroundEncoder: SurroundAudioEncoder = .eac3,
                      deinterlaceFilter: String? = Deinterlace.filter,
-                     burnInSubtitle: SubtitleBurnIn? = nil) -> ConversionPlan {
+                     burnInSubtitle: SubtitleBurnIn? = nil,
+                     receiver: AirPlayReceiver = .appleTV4K,
+                     canToneMap: Bool = true) -> ConversionPlan {
         let plan = basePlan(info: info, intent: intent, selectedAudioID: selectedAudioID,
                             audioProcessingMode: audioProcessingMode, syncAdjustment: syncAdjustment,
                             requiresSubtitleMuxing: requiresSubtitleMuxing, surroundEncoder: surroundEncoder,
-                            deinterlaceFilter: deinterlaceFilter, burnInSubtitle: burnInSubtitle)
+                            deinterlaceFilter: deinterlaceFilter, burnInSubtitle: burnInSubtitle,
+                            receiver: intent == .airPlay ? receiver : .appleTV4K, canToneMap: canToneMap)
         guard burnInSubtitle != nil, plan.steps.allSatisfy(\.burnsInSubtitle), !plan.steps.isEmpty else { return plan }
         return ConversionPlan(intent: intent, steps: plan.steps,
             reason: "The selected bitmap subtitle is burned into the video, which needs a full video encode.")
@@ -731,20 +792,27 @@ enum TranscodePlanner {
     private static func basePlan(info: MediaInfo, intent: PlaybackIntent, selectedAudioID: Int?,
                                  audioProcessingMode: AudioProcessingMode, syncAdjustment: SyncAdjustment,
                                  requiresSubtitleMuxing: Bool, surroundEncoder: SurroundAudioEncoder,
-                                 deinterlaceFilter: String?, burnInSubtitle: SubtitleBurnIn?) -> ConversionPlan {
+                                 deinterlaceFilter: String?, burnInSubtitle: SubtitleBurnIn?,
+                                 receiver: AirPlayReceiver, canToneMap: Bool) -> ConversionPlan {
         let video = info.videoCodec?.lowercased()
-        let appleTVIssues = intent == .airPlay ? AppleTVVideoCompatibility.issues(for: info) : []
+        let appleTVIssues = intent == .airPlay ? AppleTVVideoCompatibility.issues(for: info, receiver: receiver) : []
+        // HDR stays HDR (HEVC Main 10) unless the AirPlay receiver is SDR-only.
+        let keepsHDR = receiver.acceptsHDR
         // Local playback copies any H.264/HEVC. AirPlay copies only video the Apple TV decodes.
         // A burned-in subtitle needs the video re-encoded for either intent.
         let canCopyVideo = ["h264", "hevc"].contains(video) && appleTVIssues.isEmpty && burnInSubtitle == nil
-        let conforming = intent == .airPlay ? AppleTVVideoCompatibility.conformingArguments(for: info)
+        let conforming = intent == .airPlay ? AppleTVVideoCompatibility.conformingArguments(for: info, receiver: receiver)
                                             : (filters: [], output: [])
-        let h264Encode = VideoFilterGraph.arguments(pre: Deinterlace.filters(for: info, filter: deinterlaceFilter),
-                                                    post: conforming.filters + ["format=yuv420p"],
-                                                    burnIn: burnInSubtitle, info: info)
+        // The 8-bit H.264 encode tone-maps HDR to BT.709 SDR; without it, the
+        // output would be 8-bit video still tagged PQ or HLG.
+        let toneMaps = ToneMap.isNeeded(for: info) && canToneMap
+        let h264Encode = VideoFilterGraph.arguments(
+                pre: Deinterlace.filters(for: info, filter: deinterlaceFilter) + (toneMaps ? ToneMap.filters : []),
+                post: conforming.filters + ["format=yuv420p"],
+                burnIn: burnInSubtitle, info: info, outputIsHDR: info.hdrTransfer != nil && !toneMaps)
             + conforming.output
             + ["-c:v", "h264_videotoolbox",
-               "-b:v", "\(VideoBitRate.kilobits(for: info, intent: intent, target: .h264))k"]
+               "-b:v", "\(VideoBitRate.kilobits(for: info, intent: intent, target: .h264, receiver: receiver))k"]
         let audioTrack = info.audioTracks.first(where: { $0.id == selectedAudioID }) ?? info.audioTracks.first
         let audio = audioTrack?.codec.lowercased()
         let preferredAudio = AudioArguments.preferred(audioTrack, mode: audioProcessingMode,
@@ -789,7 +857,7 @@ enum TranscodePlanner {
             }, reason: reason)
         }
 
-        if intent == .airPlay, video == "hevc", info.isHDR {
+        if intent == .airPlay, video == "hevc", info.isHDR, keepsHDR {
             let remux = !canCopyVideo ? [] : [
                 // Dolby Vision RPUs are NAL type 62. A single-track dual-layer
                 // profile 7 stream also wraps every enhancement-layer NAL,
@@ -804,7 +872,7 @@ enum TranscodePlanner {
                     audioArguments: preferredAudio, requiresHVC1: true,
                     audioProcessingMode: audioProcessingMode, requiredTransfer: info.hdrTransfer)
             ]
-            let reason = !appleTVIssues.isEmpty ? AppleTVVideoCompatibility.reason(for: appleTVIssues)
+            let reason = !appleTVIssues.isEmpty ? AppleTVVideoCompatibility.reason(for: appleTVIssues, receiver: receiver)
                 : info.isDualLayerDolbyVision ? "Dual-layer Dolby Vision (profile 7) plays on Apple TV only as its HDR10 base layer."
                 : info.isDolbyVision ? "Dolby Vision needs an Apple TV compatible HDR10 fallback."
                 : "HDR HEVC needs an AirPlay-safe MP4 sample entry."
@@ -818,7 +886,7 @@ enum TranscodePlanner {
         // AV1, VP9, and other HDR sources that cannot be stream-copied. The
         // generic H.264 encode would produce 8-bit video still tagged PQ/HLG,
         // so HDR is encoded as HEVC Main 10 instead, with no H.264 fallback.
-        if let transfer = info.hdrTransfer, !canCopyVideo {
+        if let transfer = info.hdrTransfer, !canCopyVideo, keepsHDR {
             return ConversionPlan(intent: intent, steps: encodeSteps(strategy: .hardwareEncode,
                     reason: "Encode HDR video as HEVC Main 10, keeping its HDR signalling.",
                     videoArguments: HDRVideoArguments.hevcMain10(for: info, intent: intent,
@@ -852,6 +920,6 @@ enum TranscodePlanner {
             requiredTransfer: nil)
         return ConversionPlan(intent: intent, steps: steps, reason: appleTVIssues.isEmpty
             ? "Prepare a compatible MP4 using the least destructive available strategy."
-            : AppleTVVideoCompatibility.reason(for: appleTVIssues))
+            : AppleTVVideoCompatibility.reason(for: appleTVIssues, receiver: receiver))
     }
 }

@@ -15,6 +15,7 @@ enum TranscodeError: LocalizedError {
     case audioFilterUnavailable(String)
     case av1DecoderUnavailable
     case subtitleBurnInUnavailable(String)
+    case toneMappingUnavailable(String)
 
     var errorDescription: String? {
         switch self {
@@ -30,6 +31,8 @@ enum TranscodeError: LocalizedError {
         case .audioFilterUnavailable(let details): return "Late Night audio is unavailable: \(details)"
         case .av1DecoderUnavailable:
             return "This video uses AV1, which the selected FFmpeg cannot decode on this Mac. Use the bundled FFmpeg or a build that includes libdav1d."
+        case .toneMappingUnavailable(let details):
+            return "HDR video cannot be prepared for an SDR-only AirPlay receiver: \(details)"
         case .subtitleBurnInUnavailable(let details):
             return "The selected subtitle cannot be burned into the video: \(details)"
         }
@@ -42,7 +45,8 @@ struct PreparedArtifact: Sendable {
     let reason: String
     let isAirPlayPrepared: Bool
     /// Whether the copy's probed video is within Apple TV limits; nil when not probed.
-    var isAppleTVCompatible: Bool? = nil
+    /// FFprobe information for the prepared copy; nil when not probed.
+    var outputInfo: MediaInfo? = nil
 }
 
 private final class RunningProcess: @unchecked Sendable {
@@ -313,7 +317,9 @@ enum TranscodeService {
     static func prepare(input: URL, info: MediaInfo, selection: TrackSelection,
                         intent: PlaybackIntent, syncAdjustment: SyncAdjustment = .zero,
                         audioProcessingMode: AudioProcessingMode = .standard,
+                        receiver: AirPlayReceiver = .appleTV4K,
                         progress: @escaping @Sendable (Double) -> Void) async throws -> PreparedArtifact {
+        let receiver: AirPlayReceiver = intent == .airPlay ? receiver : .appleTV4K
         guard info.videoCodec != nil else { throw TranscodeError.noVideo }
         guard let installation = FFmpegLocator.locate() else { throw TranscodeError.ffmpegNotFound }
         if audioProcessingMode == .lateNight,
@@ -347,13 +353,28 @@ enum TranscodeService {
                 throw TranscodeError.subtitleBurnInUnavailable("the selected FFmpeg lacks the overlay, setpts, or colorchannelmixer filter. Use the bundled FFmpeg.")
             }
         }
+        var canToneMap = false
+        if ToneMap.isNeeded(for: info) {
+            let filters = await filterNames(using: installation)
+            canToneMap = ToneMap.requiredFilters.allSatisfy(filters.contains)
+        }
+        if !receiver.acceptsHDR, info.isHDR {
+            if info.isDolbyVisionProfile5 {
+                throw TranscodeError.toneMappingUnavailable("Dolby Vision profile 5 has no HDR10 base layer to convert.")
+            }
+            if ToneMap.isNeeded(for: info), !canToneMap {
+                throw TranscodeError.toneMappingUnavailable("the selected FFmpeg lacks the scale_vt, hwupload, or hwdownload filter. Use the bundled FFmpeg.")
+            }
+        }
         let plan = TranscodePlanner.plan(info: info, intent: intent, selectedAudioID: selection.audioID,
                                          audioProcessingMode: audioProcessingMode,
                                          syncAdjustment: syncAdjustment,
                                          requiresSubtitleMuxing: selection.hasSelectedSubtitle,
                                          surroundEncoder: surroundEncoder,
                                          deinterlaceFilter: deinterlacer,
-                                         burnInSubtitle: burnIn)
+                                         burnInSubtitle: burnIn,
+                                         receiver: receiver,
+                                         canToneMap: canToneMap)
         if plan.steps.isEmpty {
             return PreparedArtifact(url: input, strategy: .directPlay, reason: plan.reason, isAirPlayPrepared: false)
         }
@@ -370,7 +391,7 @@ enum TranscodeService {
                 let arguments = try ffmpegArguments(input: input, output: reservation.temporary,
                     step: step, selection: selection, sourceHasAudio: info.hasAudio,
                     syncAdjustment: syncAdjustment, mediaDuration: info.duration,
-                    inputArguments: inputArguments)
+                    inputArguments: ToneMap.inputArguments(for: step) + inputArguments)
                 try await runProcess(executable: installation.ffmpeg, arguments: arguments,
                     duration: info.duration, progress: progress)
                 try Task.checkCancellation()
@@ -380,18 +401,18 @@ enum TranscodeService {
                 guard validation.isValid else {
                     throw TranscodeError.invalidOutput(validation.reason ?? "Unknown validation error")
                 }
-                // AirPlay copies must probe as Apple TV compatible. Local copies
-                // record the result so a compatible one is not converted again.
-                var outputIssues: [AppleTVVideoCompatibility.Issue]?
+                // AirPlay copies must probe as compatible with the receiver. Local
+                // copies record the probe so a compatible one is not converted again.
+                var outputInfo: MediaInfo?
                 if intent == .airPlay {
                     let output = try await FFprobeService.probe(reservation.temporary, using: installation)
-                    let issues = AppleTVVideoCompatibility.issues(for: output)
+                    let issues = AppleTVVideoCompatibility.issues(for: output, receiver: receiver)
                     guard issues.isEmpty else {
-                        throw TranscodeError.invalidOutput(AppleTVVideoCompatibility.reason(for: issues))
+                        throw TranscodeError.invalidOutput(AppleTVVideoCompatibility.reason(for: issues, receiver: receiver))
                     }
-                    outputIssues = issues
-                } else if let output = try? await FFprobeService.probe(reservation.temporary, using: installation) {
-                    outputIssues = AppleTVVideoCompatibility.issues(for: output)
+                    outputInfo = output
+                } else {
+                    outputInfo = try? await FFprobeService.probe(reservation.temporary, using: installation)
                 }
                 try FileManager.default.moveItem(at: reservation.temporary, to: reservation.destination)
                 do {
@@ -400,7 +421,8 @@ enum TranscodeService {
                         expectedDuration: info.duration, requiresHVC1: step.requiresHVC1,
                         selectedSubtitle: selection.subtitle, syncAdjustment: syncAdjustment,
                         audioProcessingMode: audioProcessingMode, playbackIntent: intent,
-                        requiredTransfer: step.requiredTransfer, requiresDolbyVision: step.requiresDolbyVision)
+                        requiredTransfer: step.requiredTransfer, requiresDolbyVision: step.requiresDolbyVision,
+                        airPlayReceiver: intent == .airPlay ? receiver : nil)
                 } catch {
                     try? FileManager.default.removeItem(at: reservation.destination)
                     throw error
@@ -408,7 +430,7 @@ enum TranscodeService {
                 progress(1)
                 return PreparedArtifact(url: reservation.destination, strategy: step.strategy,
                     reason: step.reason, isAirPlayPrepared: intent == .airPlay,
-                    isAppleTVCompatible: outputIssues.map(\.isEmpty))
+                    outputInfo: outputInfo)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {

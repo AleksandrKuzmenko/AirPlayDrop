@@ -110,7 +110,7 @@ cd "$build_dir"
   --disable-muxers \
   --enable-muxer=mp4,mov \
   --disable-filters \
-  --enable-filter=acompressor,adelay,aformat,alimiter,anull,aresample,asetpts,atrim,bwdif,colorchannelmixer,format,null,overlay,scale,setparams,setpts \
+  --enable-filter=acompressor,adelay,aformat,alimiter,anull,aresample,asetpts,atrim,bwdif,colorchannelmixer,format,hwdownload,hwupload,null,overlay,scale,scale_vt,setparams,setpts \
   --disable-protocols \
   --enable-protocol=file,pipe \
   --disable-indevs \
@@ -150,6 +150,9 @@ done
 "$install_dir/bin/ffmpeg" -hide_banner -filters 2>&1 | grep -q ' overlay '
 "$install_dir/bin/ffmpeg" -hide_banner -filters 2>&1 | grep -q 'colorchannelmixer'
 "$install_dir/bin/ffmpeg" -hide_banner -filters 2>&1 | grep -q ' setpts '
+"$install_dir/bin/ffmpeg" -hide_banner -filters 2>&1 | grep -q 'scale_vt'
+"$install_dir/bin/ffmpeg" -hide_banner -filters 2>&1 | grep -q 'hwupload'
+"$install_dir/bin/ffmpeg" -hide_banner -filters 2>&1 | grep -q 'hwdownload'
 "$install_dir/bin/ffmpeg" -hide_banner -bsfs 2>&1 | grep -q 'filter_units'
 "$install_dir/bin/ffmpeg" -hide_banner -bsfs 2>&1 | grep -q 'setts'
 "$install_dir/bin/ffmpeg" -hide_banner -muxers 2>&1 | grep -q 'mp4'
