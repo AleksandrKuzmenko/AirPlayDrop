@@ -8,26 +8,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
-            xcode: /Applications/Xcode_15.4.app
+          # GitHub retired the macos-14 image. The oldest Xcode installed on
+          # macos-15 stands in for the oldest supported toolchain.
+          - runner: macos-15
+            xcode: oldest
           - runner: macos-15
             xcode: default
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Select oldest supported Xcode
-        if: matrix.xcode != 'default'
-        run: sudo xcode-select --switch "${{ matrix.xcode }}"
+      - name: Select oldest installed Xcode
+        if: matrix.xcode == 'oldest'
+        run: |
+          oldest=$(ls -d /Applications/Xcode_*.app | sort -V | head -n 1)
+          echo "Selecting $oldest"
+          sudo xcode-select --switch "$oldest"
       - name: Toolchain
         run: xcodebuild -version
       - name: Verify
         run: ./scripts/verify.sh
 
   ffmpeg-integration:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: sudo xcode-select --switch /Applications/Xcode_15.4.app
       - name: Install FFmpeg
         run: brew install ffmpeg
       - name: Run generated-media integration test
