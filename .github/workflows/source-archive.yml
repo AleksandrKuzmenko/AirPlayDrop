@@ -9,12 +9,11 @@ permissions:
 
 jobs:
   verify-and-release:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - run: sudo xcode-select --switch /Applications/Xcode_15.4.app
       - name: Verify tagged source
         run: ./scripts/verify.sh
       - name: Create immutable source archive

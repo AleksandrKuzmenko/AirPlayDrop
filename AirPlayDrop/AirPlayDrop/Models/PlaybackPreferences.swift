@@ -23,6 +23,8 @@ struct PlaybackPreferences: Codable, Equatable, Sendable {
     var preferredAudioLanguages: [String]
     var preferredSubtitleLanguages: [String]
     var subtitleDefaultMode: SubtitleDefaultMode
+    /// The AirPlay receiver video is prepared for.
+    var airPlayReceiver: AirPlayReceiver
 
     var audioLanguages: [String] {
         get { preferredAudioLanguages }
@@ -36,10 +38,12 @@ struct PlaybackPreferences: Codable, Equatable, Sendable {
 
     init(preferredAudioLanguages: [String] = PlaybackPreferences.systemAudioLanguages,
          preferredSubtitleLanguages: [String] = [],
-         subtitleDefaultMode: SubtitleDefaultMode = .off) {
+         subtitleDefaultMode: SubtitleDefaultMode = .off,
+         airPlayReceiver: AirPlayReceiver = .appleTV4K) {
         self.preferredAudioLanguages = Self.normalizedCodes(preferredAudioLanguages)
         self.preferredSubtitleLanguages = Self.normalizedCodes(preferredSubtitleLanguages)
         self.subtitleDefaultMode = subtitleDefaultMode
+        self.airPlayReceiver = airPlayReceiver
     }
 
     /// Convenience spelling for callers that use the shorter property names.
@@ -82,6 +86,7 @@ struct PlaybackPreferences: Codable, Equatable, Sendable {
         case preferredAudioLanguages
         case preferredSubtitleLanguages
         case subtitleDefaultMode
+        case airPlayReceiver
     }
 
     init(from decoder: Decoder) throws {
@@ -93,7 +98,9 @@ struct PlaybackPreferences: Codable, Equatable, Sendable {
             preferredSubtitleLanguages: try container.decodeIfPresent([String].self, forKey: .preferredSubtitleLanguages)
                 ?? [],
             subtitleDefaultMode: try container.decodeIfPresent(SubtitleDefaultMode.self, forKey: .subtitleDefaultMode)
-                ?? .off
+                ?? .off,
+            airPlayReceiver: (try? container.decodeIfPresent(AirPlayReceiver.self, forKey: .airPlayReceiver))
+                .flatMap { $0 } ?? .appleTV4K
         )
     }
 
@@ -103,6 +110,7 @@ struct PlaybackPreferences: Codable, Equatable, Sendable {
         try container.encode(preferredAudioLanguages, forKey: .preferredAudioLanguages)
         try container.encode(preferredSubtitleLanguages, forKey: .preferredSubtitleLanguages)
         try container.encode(subtitleDefaultMode, forKey: .subtitleDefaultMode)
+        try container.encode(airPlayReceiver, forKey: .airPlayReceiver)
     }
 }
 

@@ -24,14 +24,53 @@ final class MediaItem: Identifiable, @unchecked Sendable {
     /// HDR/DV needs an explicitly AirPlay-safe conversion. A generic remux may
     /// produce an MP4 while retaining Dolby Vision RPU data, an `hev1` sample
     /// entry, or other stream metadata that Apple TV cannot consume.
-    var needsAirPlayTranscode: Bool {
-        !isAirPlayPrepared && !formatFlags.isEmpty
+    ///
+    /// Video the Mac plays but the Apple TV cannot decode, such as 10-bit or
+    /// 4:2:2 H.264, HEVC range extensions, AV1, or anything above 2160p60,
+    /// also needs a conversion. AVFoundation reports such HEVC sources as
+    /// AirPlay-prepared, so only a copy made by an AirPlay plan for the same
+    /// receiver skips the check.
+    func needsAirPlayTranscode(for receiver: AirPlayReceiver) -> Bool {
+        if hasAirPlayPreparedCopy(for: receiver) { return false }
+        if !playedVideoIsCompatible(with: receiver) { return true }
+        return !isAirPlayPrepared && !effectiveFormatFlags.isEmpty
+    }
+
+    /// FFprobe information for a prepared copy, probed after preparation. It
+    /// applies only while that copy is the one being played.
+    var preparedCopyInfo: (url: URL, info: MediaInfo)?
+
+    /// The AirPlay receiver an AirPlay-prepared copy was made for.
+    var preparedReceiver: AirPlayReceiver?
+
+    /// Judges the file AVPlayer will stream: a probed prepared copy when there
+    /// is one (a local H.264 encode of a VP9 source is already compatible),
+    /// otherwise the source.
+    func playedVideoIsCompatible(with receiver: AirPlayReceiver) -> Bool {
+        if let transcodedURL, let copy = preparedCopyInfo, copy.url == transcodedURL {
+            return AppleTVVideoCompatibility.isCompatible(copy.info, receiver: receiver)
+        }
+        guard let mediaInfo else { return true }
+        return AppleTVVideoCompatibility.isCompatible(mediaInfo, receiver: receiver)
+    }
+
+    func hasAirPlayPreparedCopy(for receiver: AirPlayReceiver) -> Bool {
+        isAirPlayPrepared && playbackIntent == .airPlay && transcodedURL != nil
+            && (preparedReceiver ?? .appleTV4K) == receiver
+    }
+
+    /// HDR/DV markers from AVFoundation combined with those from FFprobe.
+    /// AVFoundation inspects only sources it can open, so containers such as
+    /// MKV report their HDR/DV status through FFprobe alone.
+    var effectiveFormatFlags: Set<VideoFormatFlag> {
+        formatFlags.union(mediaInfo?.formatFlags ?? [])
     }
 
     var formatTag: String? {
-        if formatFlags.contains(.dolbyVision) { return "DV" }
-        if formatFlags.contains(.hdr10)       { return "HDR" }
-        if formatFlags.contains(.hlg)         { return "HLG" }
+        let flags = effectiveFormatFlags
+        if flags.contains(.dolbyVision) { return "DV" }
+        if flags.contains(.hdr10)       { return "HDR" }
+        if flags.contains(.hlg)         { return "HLG" }
         return nil
     }
 

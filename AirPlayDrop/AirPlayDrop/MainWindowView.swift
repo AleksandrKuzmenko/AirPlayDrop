@@ -24,6 +24,7 @@ struct MainWindowView: View {
                 onChooseSubtitle: { store.chooseSubtitle($1, for: $0) },
                 onChooseSubtitleSelection: { store.chooseSubtitle($1, for: $0) },
                 onAttachSubtitle: { attachSubtitle(to: $0) },
+                onSetSubtitleBurnIn: { store.setSubtitleBurnIn($1, for: $0) },
                 onSetAudioProcessingMode: { store.setAudioProcessingMode($1, for: $0) },
                 onAdjustSynchronization: { synchronizationItem = $0 }
             )
@@ -279,12 +280,14 @@ struct PlaybackSettingsView: View {
     @State private var audioLanguages: String
     @State private var subtitleLanguages: String
     @State private var subtitleMode: SubtitleDefaultMode
+    @State private var airPlayReceiver: AirPlayReceiver
 
     init() {
         let preferences = PlaybackPreferencesStore().preferences
         _audioLanguages = State(initialValue: preferences.preferredAudioLanguages.joined(separator: ", "))
         _subtitleLanguages = State(initialValue: preferences.preferredSubtitleLanguages.joined(separator: ", "))
         _subtitleMode = State(initialValue: preferences.subtitleDefaultMode)
+        _airPlayReceiver = State(initialValue: preferences.airPlayReceiver)
     }
 
     var body: some View {
@@ -307,6 +310,15 @@ struct PlaybackSettingsView: View {
                 }
             }
             .accessibilityLabel("Subtitle default mode for newly imported videos")
+            Picker("AirPlay receiver", selection: $airPlayReceiver) {
+                ForEach(AirPlayReceiver.allCases, id: \.self) { receiver in
+                    Text(receiver.label).tag(receiver)
+                }
+            }
+            .accessibilityLabel("AirPlay receiver that videos are prepared for")
+            Text("Choose an SDR-only receiver for an Apple TV HD or a TV without HDR and HEVC. HDR video is then tone-mapped to 1080p SDR H.264.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             HStack {
                 Button("Reset to System Default") {
                     preferenceStore.reset()
@@ -314,13 +326,15 @@ struct PlaybackSettingsView: View {
                     audioLanguages = value.preferredAudioLanguages.joined(separator: ", ")
                     subtitleLanguages = ""
                     subtitleMode = .off
+                    airPlayReceiver = .appleTV4K
                 }
                 Spacer()
                 Button("Save") {
                     preferenceStore.preferences = PlaybackPreferences(
                         preferredAudioLanguages: audioLanguages.split(separator: ",").map(String.init),
                         preferredSubtitleLanguages: subtitleLanguages.split(separator: ",").map(String.init),
-                        subtitleDefaultMode: subtitleMode)
+                        subtitleDefaultMode: subtitleMode,
+                        airPlayReceiver: airPlayReceiver)
                     dismiss()
                 }
                 .keyboardShortcut(.defaultAction)

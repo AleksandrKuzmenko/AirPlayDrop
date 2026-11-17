@@ -17,11 +17,13 @@ enum FFmpegLocator {
     static let standardDirectories = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
 
     static func locate(fileManager: FileManager = .default, defaults: UserDefaults = .standard,
-                       environment: [String: String] = ProcessInfo.processInfo.environment) -> FFmpegInstallation? {
+                       environment: [String: String] = ProcessInfo.processInfo.environment,
+                       bundledDirectory: URL? = Bundle.main.resourceURL?.appendingPathComponent("bin")) -> FFmpegInstallation? {
         var directories: [String] = []
         if let configured = defaults.string(forKey: configuredDirectoryKey), !configured.isEmpty {
             directories.append((configured as NSString).expandingTildeInPath)
         }
+        if let bundledDirectory { directories.append(bundledDirectory.path) }
         directories += (environment["PATH"] ?? "").split(separator: ":").map(String.init)
         directories += standardDirectories
         for directory in directories.reduce(into: [String](), { if !$0.contains($1) { $0.append($1) } }) {

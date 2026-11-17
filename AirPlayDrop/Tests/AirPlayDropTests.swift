@@ -12,9 +12,85 @@ final class AirPlayDropTests: XCTestCase {
             tracks.append(MediaTrack(id: 2, kind: .audio, codec: audio, language: "eng", title: "English",
                 channels: 6, isDefault: true, isTextSubtitle: false))
         }
-        return MediaInfo(formatName: format, duration: 120, videoCodec: video, videoProfile: "Main 10",
-            pixelFormat: "yuv420p10le", colorTransfer: hdr ? "smpte2084" : nil,
+        let h264 = video == "h264"
+        return MediaInfo(formatName: format, duration: 120, videoCodec: video,
+            videoProfile: h264 ? "High" : "Main 10", pixelFormat: h264 ? "yuv420p" : "yuv420p10le",
+            colorTransfer: hdr ? "smpte2084" : nil,
             isDolbyVision: dolbyVision, tracks: tracks)
+    }
+
+    func testParseDecoderNamesReadsFFmpegDecoderTable() {
+        let text = """
+        Decoders:
+         V..... = Video
+         A..... = Audio
+         ------
+         V....D av1                  Alliance for Open Media AV1
+         V....D libdav1d             dav1d AV1 decoder by VideoLAN (codec av1)
+         VFS..D hevc                 HEVC (High Efficiency Video Coding)
+         A....D truehd               TrueHD
+        """
+        let names = TranscodeService.parseDecoderNames(text)
+        XCTAssertEqual(names, ["av1", "libdav1d", "hevc", "truehd"])
+    }
+
+    func testAV1PrefersSoftwareDecoderThenHardwareAccelerator() throws {
+        XCTAssertEqual(try TranscodeService.inputDecoderArguments(videoCodec: "av1",
+            hasSoftwareAV1Decoder: true, hasHardwareAV1Decoder: true), [])
+        XCTAssertEqual(try TranscodeService.inputDecoderArguments(videoCodec: "av1",
+            hasSoftwareAV1Decoder: false, hasHardwareAV1Decoder: true), ["-hwaccel", "videotoolbox"])
+        XCTAssertThrowsError(try TranscodeService.inputDecoderArguments(videoCodec: "av1",
+            hasSoftwareAV1Decoder: false, hasHardwareAV1Decoder: false)) { error in
+            guard case TranscodeError.av1DecoderUnavailable = error else {
+                return XCTFail("Expected av1DecoderUnavailable, got \(error)")
+            }
+        }
+        XCTAssertEqual(try TranscodeService.inputDecoderArguments(videoCodec: "hevc",
+            hasSoftwareAV1Decoder: false, hasHardwareAV1Decoder: false), [])
+    }
+
+    func testInputDecoderArgumentsPrecedeSourceInput() throws {
+        let step = TranscodePlanner.plan(info: info(video: "av1"), intent: .airPlay, selectedAudioID: 2).steps.last!
+        let args = try TranscodeService.ffmpegArguments(input: URL(fileURLWithPath: "/in.mkv"),
+            output: URL(fileURLWithPath: "/out.mp4"), step: step,
+            selection: TrackSelection(audioID: 2), sourceHasAudio: true,
+            inputArguments: ["-hwaccel", "videotoolbox"])
+        let hwaccel = try XCTUnwrap(args.firstIndex(of: "-hwaccel"))
+        let input = try XCTUnwrap(args.firstIndex(of: "-i"))
+        XCTAssertEqual(args[hwaccel + 1], "videotoolbox")
+        XCTAssertLessThan(hwaccel, input)
+        XCTAssertEqual(args[input + 1], "/in.mkv")
+    }
+
+    func testFFprobeHDRInfoTriggersAirPlayPreparationWithoutAVFoundationFlags() {
+        // An HDR/DV MKV is not openable by AVFoundation, so formatFlags stays
+        // empty and only FFprobe knows the stream is HDR. A locally prepared
+        // copy must still be re-prepared before AirPlay playback.
+        let item = MediaItem(fileURL: URL(fileURLWithPath: "/tmp/Movie.mkv"))
+        item.mediaInfo = info(hdr: true, dolbyVision: true)
+        item.transcodedURL = URL(fileURLWithPath: "/tmp/Movie_airplay.mp4")
+        item.isAirPlayPrepared = false
+        XCTAssertTrue(item.formatFlags.isEmpty)
+        XCTAssertEqual(item.effectiveFormatFlags, [.dolbyVision, .hdr10])
+        XCTAssertTrue(item.needsAirPlayTranscode(for: .appleTV4K))
+        XCTAssertEqual(item.formatTag, "DV")
+
+        item.isAirPlayPrepared = true
+        XCTAssertFalse(item.needsAirPlayTranscode(for: .appleTV4K))
+    }
+
+    func testSDRInfoDoesNotTriggerAirPlayPreparation() {
+        let item = MediaItem(fileURL: URL(fileURLWithPath: "/tmp/Movie.mkv"))
+        item.mediaInfo = info(hdr: false)
+        XCTAssertFalse(item.needsAirPlayTranscode(for: .appleTV4K))
+        XCTAssertNil(item.formatTag)
+    }
+
+    func testHLGInfoMapsToHLGFlag() {
+        let hlg = MediaInfo(formatName: "matroska,webm", duration: 10, videoCodec: "hevc",
+            videoProfile: "Main 10", pixelFormat: "yuv420p10le", colorTransfer: "arib-std-b67",
+            isDolbyVision: false, tracks: [])
+        XCTAssertEqual(hlg.formatFlags, [.hlg])
     }
 
     func testOutputReservationKeepsMP4ExtensionAndAvoidsCollision() throws {
@@ -61,7 +137,7 @@ final class AirPlayDropTests: XCTestCase {
     func testMatroskaUsesTypedFallbacks() {
         let plan = TranscodePlanner.plan(info: info(), intent: .local)
         XCTAssertEqual(plan.steps.first?.strategy, .remux)
-        XCTAssertEqual(plan.steps.last?.strategy, .softwareEncode)
+        XCTAssertEqual(plan.steps.last?.strategy, .hardwareEncode)
     }
 
     func testDolbyVisionAirPlayStartsWithHDRRemux() {
@@ -71,9 +147,429 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertTrue(plan.reason.contains("Dolby Vision"))
     }
 
-    func testUnsupportedVideoIncludesHardwareAndSoftwareFallbacks() {
-        let strategies = TranscodePlanner.plan(info: info(video: "av1", audio: "opus"), intent: .airPlay).steps.map(\.strategy)
-        XCTAssertEqual(strategies, [.hardwareEncode, .softwareEncode])
+    func testUnsupportedVideoUsesAppleHardwareEncoding() {
+        let steps = TranscodePlanner.plan(info: info(video: "av1", audio: "opus"), intent: .airPlay).steps
+        XCTAssertEqual(steps.map(\.strategy), [.hardwareEncode])
+        XCTAssertTrue(steps[0].videoArguments.contains("h264_videotoolbox"))
+        XCTAssertNil(steps[0].requiredTransfer)
+    }
+
+    private func audioTrack(_ codec: String, channels: Int?) -> MediaTrack {
+        MediaTrack(id: 2, kind: .audio, codec: codec, language: "eng", title: nil,
+                   channels: channels, isDefault: true, isTextSubtitle: false)
+    }
+
+    func testCompatibleAudioIsCopiedOnlyWithoutProcessing() {
+        for codec in ["aac", "ac3", "eac3", "AC3"] {
+            XCTAssertEqual(AudioArguments.preferred(audioTrack(codec, channels: 6), mode: .standard,
+                syncAdjustment: .zero, surroundEncoder: .eac3), ["-c:a", "copy"], codec)
+        }
+        XCTAssertFalse(AudioArguments.canCopy(audioTrack("eac3", channels: 6), mode: .lateNight, syncAdjustment: .zero))
+        XCTAssertFalse(AudioArguments.canCopy(audioTrack("eac3", channels: 6), mode: .standard,
+                                              syncAdjustment: SyncAdjustment(audioMilliseconds: 200)))
+        XCTAssertTrue(AudioArguments.canCopy(audioTrack("eac3", channels: 6), mode: .standard,
+                                             syncAdjustment: SyncAdjustment(subtitleMilliseconds: 200)))
+        XCTAssertFalse(AudioArguments.canCopy(audioTrack("dts", channels: 6), mode: .standard, syncAdjustment: .zero))
+    }
+
+    func testSurroundAudioIsEncodedAsEAC3UpTo51() {
+        XCTAssertEqual(AudioArguments.encode(audioTrack("truehd", channels: 8), mode: .standard, surroundEncoder: .eac3),
+                       ["-c:a", "eac3", "-ac:a", "6", "-b:a", "640k"])
+        XCTAssertEqual(AudioArguments.encode(audioTrack("dts", channels: 6), mode: .standard, surroundEncoder: .eac3),
+                       ["-c:a", "eac3", "-ac:a", "6", "-b:a", "640k"])
+        XCTAssertEqual(AudioArguments.encode(audioTrack("flac", channels: 4), mode: .standard, surroundEncoder: .eac3),
+                       ["-c:a", "eac3", "-ac:a", "4", "-b:a", "448k"])
+        XCTAssertEqual(AudioArguments.encode(audioTrack("dts", channels: 6), mode: .standard, surroundEncoder: .aac),
+                       ["-c:a", "aac", "-ac:a", "6", "-b:a", "384k"])
+    }
+
+    func testStereoAndLateNightAudioStayStereoAAC() {
+        XCTAssertEqual(AudioArguments.encode(audioTrack("opus", channels: 2), mode: .standard, surroundEncoder: .eac3),
+                       AudioArguments.stereo)
+        XCTAssertEqual(AudioArguments.encode(audioTrack("mp3", channels: nil), mode: .standard, surroundEncoder: .eac3),
+                       AudioArguments.stereo)
+        XCTAssertEqual(AudioArguments.encode(audioTrack("dts", channels: 6), mode: .lateNight, surroundEncoder: .eac3),
+                       AudioArguments.stereo)
+    }
+
+    func testAirPlayPlanKeepsSurroundForDTSInMKV() {
+        let source = MediaInfo(formatName: "matroska,webm", duration: 120, videoCodec: "h264",
+            videoProfile: "High", pixelFormat: "yuv420p", colorTransfer: nil, isDolbyVision: false,
+            tracks: [audioTrack("dts", channels: 6)])
+        let steps = TranscodePlanner.plan(info: source, intent: .airPlay, selectedAudioID: 2).steps
+        XCTAssertEqual(steps.map(\.strategy), [.audioTranscode, .hardwareEncode])
+        for step in steps { XCTAssertEqual(step.audioArguments, ["-c:a", "eac3", "-ac:a", "6", "-b:a", "640k"]) }
+        let aacOnly = TranscodePlanner.plan(info: source, intent: .airPlay, selectedAudioID: 2,
+                                            surroundEncoder: .aac).steps
+        XCTAssertEqual(aacOnly.first?.audioArguments, ["-c:a", "aac", "-ac:a", "6", "-b:a", "384k"])
+    }
+
+    func testAirPlayPlanCopiesEAC3AndFallsBackToEncodedAudio() {
+        let source = MediaInfo(formatName: "matroska,webm", duration: 120, videoCodec: "mpeg2video",
+            videoProfile: nil, pixelFormat: "yuv420p", colorTransfer: nil, isDolbyVision: false,
+            tracks: [audioTrack("eac3", channels: 6)])
+        let steps = TranscodePlanner.plan(info: source, intent: .airPlay, selectedAudioID: 2).steps
+        XCTAssertEqual(steps.map(\.strategy), [.hardwareEncode, .hardwareEncode])
+        XCTAssertEqual(steps[0].audioArguments, ["-c:a", "copy"])
+        XCTAssertEqual(steps[1].audioArguments, ["-c:a", "eac3", "-ac:a", "6", "-b:a", "640k"])
+
+        let h264 = MediaInfo(formatName: "matroska,webm", duration: 120, videoCodec: "h264",
+            videoProfile: "High", pixelFormat: "yuv420p", colorTransfer: nil, isDolbyVision: false,
+            tracks: [audioTrack("ac3", channels: 6)])
+        let remux = TranscodePlanner.plan(info: h264, intent: .airPlay, selectedAudioID: 2).steps.first
+        XCTAssertEqual(remux?.strategy, .remux)
+        XCTAssertEqual(remux?.audioArguments, ["-c:a", "copy"])
+    }
+
+    func testHDRRemuxCopiesCompatibleSurround() {
+        let source = MediaInfo(formatName: "matroska,webm", duration: 120, videoCodec: "hevc",
+            videoProfile: "Main 10", pixelFormat: "yuv420p10le", colorTransfer: "smpte2084", isDolbyVision: true,
+            tracks: [audioTrack("eac3", channels: 6)])
+        let steps = TranscodePlanner.plan(info: source, intent: .airPlay, selectedAudioID: 2).steps
+        XCTAssertEqual(steps.map(\.strategy), [.hdrRemux, .hardwareEncode, .hardwareEncode])
+        XCTAssertEqual(steps[0].audioArguments, ["-c:a", "copy"])
+        XCTAssertEqual(steps[2].audioArguments.first(where: { $0 == "eac3" }), "eac3")
+    }
+
+    private func video(_ codec: String, profile: String?, pixelFormat: String?, width: Int? = 1920,
+                       height: Int? = 1080, frameRate: String? = "24000/1001", hdr: Bool = false) -> MediaInfo {
+        MediaInfo(formatName: "mov,mp4,m4a,3gp,3g2,mj2", duration: 120, videoCodec: codec,
+            videoProfile: profile, pixelFormat: pixelFormat, colorTransfer: hdr ? "arib-std-b67" : nil,
+            isDolbyVision: false, tracks: [audioTrack("aac", channels: 2)],
+            width: width, height: height, averageFrameRate: frameRate)
+    }
+
+    func testProbeMapsVideoDimensionsAndFrameRate() throws {
+        // Verbatim FFprobe 9.0.2 fields from a generated 10-bit libx264 clip.
+        let data = #"{"streams":[{"index":0,"codec_name":"h264","profile":"High 10","codec_type":"video","width":320,"height":180,"pix_fmt":"yuv420p10le","level":12,"r_frame_rate":"24/1","avg_frame_rate":"24/1"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"1.000000"}}"#.data(using: .utf8)!
+        let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))
+        XCTAssertEqual(mapped.width, 320)
+        XCTAssertEqual(mapped.height, 180)
+        XCTAssertEqual(mapped.frameRate, 24)
+        XCTAssertEqual(AppleTVVideoCompatibility.issues(for: mapped),
+                       [.profile("High 10"), .pixelFormat("yuv420p10le")])
+        XCTAssertNil(video("h264", profile: nil, pixelFormat: nil, frameRate: "0/0").frameRate)
+    }
+
+    func testAppleTVRulesAcceptStreamableVideo() {
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("h264", profile: "High", pixelFormat: "yuv420p")))
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("h264", profile: "Constrained Baseline",
+            pixelFormat: "yuvj420p", width: 1080, height: 1920, frameRate: "30/1")))
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("hevc", profile: "Main 10",
+            pixelFormat: "yuv420p10le", width: 3840, height: 2160, frameRate: "60000/1001", hdr: true)))
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("hevc", profile: "Main",
+            pixelFormat: "yuv420p", width: 4096, height: 2160, frameRate: "60/1")))
+        // Variable-frame-rate 60 fps recordings often probe slightly above 60.
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("h264", profile: "High",
+            pixelFormat: "yuv420p", frameRate: "301/5")))
+        XCTAssertFalse(AppleTVVideoCompatibility.isCompatible(video("h264", profile: "High",
+            pixelFormat: "yuv420p", frameRate: "64/1")))
+        // Unrecognised profile names defer to the pixel format.
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("h264", profile: "Progressive High",
+            pixelFormat: "yuv420p")))
+        // Missing probe fields must not force a lossy re-encode.
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("hevc", profile: nil, pixelFormat: nil,
+            width: nil, height: nil, frameRate: nil)))
+        XCTAssertTrue(AppleTVVideoCompatibility.issues(for: info(video: "h264", audio: nil)).isEmpty)
+    }
+
+    func testAppleTVRulesRejectVideoTheMacPlaysButAppleTVDoesNot() {
+        typealias Rules = AppleTVVideoCompatibility
+        XCTAssertEqual(Rules.issues(for: video("h264", profile: "High 4:2:2", pixelFormat: "yuv422p")),
+                       [.profile("High 4:2:2"), .pixelFormat("yuv422p")])
+        XCTAssertEqual(Rules.issues(for: video("h264", profile: "High 4:4:4 Predictive", pixelFormat: "yuv444p")).count, 2)
+        XCTAssertEqual(Rules.issues(for: video("hevc", profile: "Rext", pixelFormat: "yuv422p10le")),
+                       [.profile("Rext"), .pixelFormat("yuv422p10le")])
+        XCTAssertEqual(Rules.issues(for: video("av1", profile: "Main", pixelFormat: "yuv420p")), [.codec("av1")])
+        XCTAssertEqual(Rules.issues(for: video("hevc", profile: "Main", pixelFormat: "yuv420p",
+            width: 7680, height: 4320)), [.resolution(width: 7680, height: 4320)])
+        XCTAssertEqual(Rules.issues(for: video("h264", profile: "High", pixelFormat: "yuv420p",
+            frameRate: "120/1")), [.frameRate(120)])
+        XCTAssertEqual(Rules.reason(for: [.profile("High 10"), .frameRate(120)]),
+                       "Apple TV cannot play the High 10 profile, 120 fps streamed over AirPlay.")
+    }
+
+    func testConformingArgumentsScaleAndHalveFrameRate() {
+        let eightK = video("hevc", profile: "Main", pixelFormat: "yuv420p", width: 7680, height: 4320,
+                           frameRate: "120000/1001")
+        let limits = AppleTVVideoCompatibility.conformingArguments(for: eightK)
+        XCTAssertEqual(limits.filters, ["scale=w=4096:h=2160:force_original_aspect_ratio=decrease:force_divisible_by=2"])
+        XCTAssertEqual(limits.output, ["-r", "120000/2002"])
+        let portrait = video("h264", profile: "High", pixelFormat: "yuv420p", width: 4320, height: 7680,
+                             frameRate: "240/1")
+        XCTAssertEqual(AppleTVVideoCompatibility.conformingArguments(for: portrait).filters,
+                       ["scale=w=2160:h=4096:force_original_aspect_ratio=decrease:force_divisible_by=2"])
+        XCTAssertEqual(AppleTVVideoCompatibility.conformingArguments(for: portrait).output, ["-r", "240/4"])
+        let fine = AppleTVVideoCompatibility.conformingArguments(for: video("h264", profile: "High", pixelFormat: "yuv420p"))
+        XCTAssertTrue(fine.filters.isEmpty)
+        XCTAssertTrue(fine.output.isEmpty)
+    }
+
+    func testAirPlayPlanNeverCopiesVideoAppleTVCannotDecode() {
+        let sources = [
+            video("h264", profile: "High 10", pixelFormat: "yuv420p10le"),
+            video("h264", profile: "High", pixelFormat: "yuv420p", frameRate: "120/1"),
+            video("hevc", profile: "Rext", pixelFormat: "yuv422p10le"),
+            video("hevc", profile: "Rext", pixelFormat: "yuv422p10le", hdr: true),
+            video("hevc", profile: "Main 10", pixelFormat: "yuv420p10le", width: 7680, height: 4320, hdr: true),
+        ]
+        for source in sources {
+            let plan = TranscodePlanner.plan(info: source, intent: .airPlay, selectedAudioID: 2)
+            XCTAssertFalse(plan.steps.isEmpty)
+            XCTAssertTrue(plan.reason.hasPrefix("Apple TV cannot play"), plan.reason)
+            for step in plan.steps {
+                XCTAssertFalse(step.videoArguments.contains("copy"), "\(step.strategy) copies video: \(step.videoArguments)")
+                XCTAssertEqual(step.strategy, .hardwareEncode)
+            }
+        }
+        let tenBit = TranscodePlanner.plan(info: sources[0], intent: .airPlay, selectedAudioID: 2).steps[0]
+        XCTAssertEqual(tenBit.videoArguments, ["-vf", "format=yuv420p", "-c:v", "h264_videotoolbox", "-b:v", "7800k"])
+        XCTAssertEqual(tenBit.audioArguments, ["-c:a", "copy"])
+        let fast = TranscodePlanner.plan(info: sources[1], intent: .airPlay, selectedAudioID: 2).steps[0]
+        XCTAssertEqual(Array(fast.videoArguments.prefix(4)), ["-vf", "format=yuv420p", "-r", "120/2"])
+        let hlg422 = TranscodePlanner.plan(info: sources[3], intent: .airPlay, selectedAudioID: 2).steps[0]
+        XCTAssertTrue(hlg422.videoArguments.contains("hevc_videotoolbox"))
+        XCTAssertEqual(hlg422.requiredTransfer, "arib-std-b67")
+        let eightK = TranscodePlanner.plan(info: sources[4], intent: .airPlay, selectedAudioID: 2).steps[0]
+        XCTAssertEqual(eightK.videoArguments[1],
+            "scale=w=4096:h=2160:force_original_aspect_ratio=decrease:force_divisible_by=2,setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc")
+    }
+
+    func testLocalPlanStillCopiesVideoTheMacPlays() {
+        let tenBit = video("h264", profile: "High 10", pixelFormat: "yuv420p10le")
+        let steps = TranscodePlanner.plan(info: tenBit, intent: .local, selectedAudioID: 2,
+                                          requiresSubtitleMuxing: true).steps
+        XCTAssertEqual(steps.first?.strategy, .remux)
+        XCTAssertEqual(steps.first?.videoArguments, ["-c:v", "copy"])
+        let compatible = video("h264", profile: "High", pixelFormat: "yuv420p")
+        XCTAssertEqual(TranscodePlanner.plan(info: compatible, intent: .airPlay, selectedAudioID: 2).steps.first?.strategy, .remux)
+    }
+
+    func testIncompatibleVideoTriggersAirPlayPreparationUntilAirPlayCopyExists() {
+        // AVFoundation marks any HEVC source with audio as AirPlay-prepared,
+        // including range-extension HEVC the Apple TV cannot decode.
+        let item = MediaItem(fileURL: URL(fileURLWithPath: "/tmp/Camera.mov"))
+        item.mediaInfo = video("hevc", profile: "Rext", pixelFormat: "yuv422p10le")
+        item.isAirPlayPrepared = true
+        XCTAssertTrue(item.needsAirPlayTranscode(for: .appleTV4K))
+
+        // An unprobed local copy is judged by its source.
+        let local = URL(fileURLWithPath: "/tmp/Camera_local.mp4")
+        item.transcodedURL = local
+        item.playbackIntent = .local
+        XCTAssertTrue(item.needsAirPlayTranscode(for: .appleTV4K))
+        // A local H.264 encode that probed compatible streams as it is.
+        item.preparedCopyInfo = (local, video("h264", profile: "High", pixelFormat: "yuv420p"))
+        XCTAssertFalse(item.needsAirPlayTranscode(for: .appleTV4K))
+        item.preparedCopyInfo = (local, video("hevc", profile: "Rext", pixelFormat: "yuv422p10le"))
+        XCTAssertTrue(item.needsAirPlayTranscode(for: .appleTV4K))
+        // A probe result for a different copy does not apply.
+        item.preparedCopyInfo = (URL(fileURLWithPath: "/tmp/Other.mp4"), video("h264", profile: "High", pixelFormat: "yuv420p"))
+        XCTAssertTrue(item.needsAirPlayTranscode(for: .appleTV4K))
+
+        item.transcodedURL = URL(fileURLWithPath: "/tmp/Camera_airplay.mp4")
+        item.playbackIntent = .airPlay
+        XCTAssertFalse(item.needsAirPlayTranscode(for: .appleTV4K))
+
+        let compatible = MediaItem(fileURL: URL(fileURLWithPath: "/tmp/Clip.mp4"))
+        compatible.mediaInfo = video("h264", profile: "High", pixelFormat: "yuv420p")
+        XCTAssertFalse(compatible.needsAirPlayTranscode(for: .appleTV4K))
+    }
+
+    private func hdrBitRate(width: Int?, height: Int?, frameRate: String?, source: Int? = nil,
+                            intent: PlaybackIntent = .airPlay) -> Int {
+        var info = video("vp9", profile: nil, pixelFormat: "yuv420p10le", width: width, height: height,
+                         frameRate: frameRate, hdr: true)
+        info.videoBitRate = source
+        return VideoBitRate.kilobits(for: info, intent: intent, target: .hevcHDR)
+    }
+
+    func testHDRBitRateFollowsAppleLadderForResolution() {
+        XCTAssertEqual(hdrBitRate(width: 1920, height: 1080, frameRate: "30/1"), 7_000)
+        XCTAssertEqual(hdrBitRate(width: 3840, height: 2160, frameRate: "30000/1001"), 20_000)
+        XCTAssertEqual(hdrBitRate(width: 2560, height: 1440, frameRate: "25/1"), 9_700)
+        // 2.39:1 1080p sits between the 720p and 1080p rungs.
+        XCTAssertEqual(hdrBitRate(width: 1920, height: 800, frameRate: "30/1"), 5_637)
+        // Tiny frames scale down but keep a floor.
+        XCTAssertEqual(hdrBitRate(width: 320, height: 180, frameRate: "30/1"), 500)
+        // AirPlay scales 8K to 2160p; local playback keeps 8K.
+        XCTAssertEqual(hdrBitRate(width: 7680, height: 4320, frameRate: "30/1"), 20_000)
+        XCTAssertEqual(hdrBitRate(width: 7680, height: 4320, frameRate: "30/1", intent: .local), 80_000)
+        // Missing size or rate must not lower quality.
+        XCTAssertEqual(hdrBitRate(width: nil, height: nil, frameRate: nil), 20_000)
+    }
+
+    func testHDRBitRateAdjustsForFrameRateAndSourceRate() {
+        XCTAssertEqual(hdrBitRate(width: 3840, height: 2160, frameRate: "24000/1001"), 16_000)
+        XCTAssertEqual(hdrBitRate(width: 3840, height: 2160, frameRate: "60/1"), 30_000)
+        XCTAssertEqual(hdrBitRate(width: 3840, height: 2160, frameRate: "60000/1001"), 29_980)
+        // AirPlay halves 120 fps, so the rate follows the 60 fps output.
+        XCTAssertEqual(hdrBitRate(width: 1920, height: 1080, frameRate: "120/1"), 10_500)
+        // A low-rate source caps the encode at 125% of its own rate.
+        XCTAssertEqual(hdrBitRate(width: 1920, height: 1080, frameRate: "30/1", source: 4_000_000), 5_000)
+        XCTAssertEqual(hdrBitRate(width: 1920, height: 1080, frameRate: "30/1", source: 40_000_000), 7_000)
+    }
+
+    private func h264BitRate(_ codec: String = "mpeg2video", width: Int?, height: Int?, frameRate: String?,
+                             source: Int? = nil) -> Int {
+        var info = video(codec, profile: nil, pixelFormat: "yuv420p", width: width, height: height,
+                         frameRate: frameRate)
+        info.videoBitRate = source
+        return VideoBitRate.kilobits(for: info, intent: .airPlay, target: .h264)
+    }
+
+    func testH264BitRateFollowsAppleLadder() {
+        XCTAssertEqual(h264BitRate(width: 1920, height: 1080, frameRate: "30/1"), 7_800)
+        XCTAssertEqual(h264BitRate(width: 1280, height: 720, frameRate: "25/1"), 4_500)
+        XCTAssertEqual(h264BitRate(width: 960, height: 540, frameRate: "30/1"), 2_000)
+        XCTAssertEqual(h264BitRate(width: 320, height: 180, frameRate: "30/1"), 500)
+        // Apple's H.264 column stops at 1080p; 2160p scales by pixel count.
+        XCTAssertEqual(h264BitRate(width: 3840, height: 2160, frameRate: "30/1"), 31_200)
+        // The 24 fps reduction applies to HEVC only; 60 fps adds half.
+        XCTAssertEqual(h264BitRate(width: 1920, height: 1080, frameRate: "24000/1001"), 7_800)
+        XCTAssertEqual(h264BitRate(width: 1920, height: 1080, frameRate: "60/1"), 11_700)
+    }
+
+    func testH264BitRateCapDependsOnSourceCodecEfficiency() {
+        // Re-encoding H.264 or older codecs allows 125% of the source rate.
+        XCTAssertEqual(h264BitRate("h264", width: 1920, height: 1080, frameRate: "30/1", source: 4_000_000), 5_000)
+        XCTAssertEqual(h264BitRate("mpeg2video", width: 1920, height: 1080, frameRate: "30/1", source: 4_000_000), 5_000)
+        // HEVC, VP9, and AV1 need about twice the rate as H.264.
+        XCTAssertEqual(h264BitRate("vp9", width: 1920, height: 1080, frameRate: "30/1", source: 3_000_000), 6_000)
+        XCTAssertEqual(h264BitRate("av1", width: 1920, height: 1080, frameRate: "30/1", source: 5_000_000), 7_800)
+        let plan = TranscodePlanner.plan(info: video("vp9", profile: nil, pixelFormat: "yuv420p",
+            width: 1280, height: 720, frameRate: "30/1"), intent: .airPlay, selectedAudioID: 2)
+        let step = plan.steps.last!
+        XCTAssertEqual(step.videoArguments.suffix(4), ["-c:v", "h264_videotoolbox", "-b:v", "4500k"])
+    }
+
+    func testHDRBitRateUsesProbedSourceRates() throws {
+        // Verbatim FFprobe 9.0.2 fields from a generated 4:2:2 HLG libx265 clip.
+        let data = #"{"streams":[{"index":0,"codec_name":"hevc","profile":"Rext","codec_type":"video","width":1920,"height":1080,"pix_fmt":"yuv422p10le","color_transfer":"arib-std-b67","color_primaries":"bt2020","avg_frame_rate":"50/1","bit_rate":"6342024"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"1.000000","bit_rate":"6455536"}}"#.data(using: .utf8)!
+        let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))
+        XCTAssertEqual(mapped.videoBitRate, 6_342_024)
+        XCTAssertEqual(mapped.containerBitRate, 6_455_536)
+        // 50 fps raises 7,000 to 9,333; the 6.34 Mbit/s source caps it at 7,928.
+        XCTAssertEqual(VideoBitRate.kilobits(for: mapped, intent: .airPlay, target: .hevcHDR), 7_928)
+        let step = TranscodePlanner.plan(info: mapped, intent: .airPlay).steps[0]
+        let rate = try XCTUnwrap(step.videoArguments.firstIndex(of: "-b:v"))
+        XCTAssertEqual(step.videoArguments[rate + 1], "7928k")
+
+        // Matroska streams have no bit_rate; mkvmerge writes a BPS tag, and
+        // FFmpeg-muxed files only have the container rate.
+        let mkv = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"vp9","tags":{"BPS-eng":"3000000"}}],"format":{"format_name":"matroska,webm","bit_rate":"3200000"}}"#.data(using: .utf8)!
+        XCTAssertEqual(FFprobeService.mediaInfo(from: try FFprobeService.parse(mkv)).estimatedVideoBitRate, 3_000_000)
+        let bare = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"vp9"}],"format":{"format_name":"matroska,webm","bit_rate":"3200000"}}"#.data(using: .utf8)!
+        XCTAssertEqual(FFprobeService.mediaInfo(from: try FFprobeService.parse(bare)).estimatedVideoBitRate, 3_200_000)
+    }
+
+    func testNonHEVCHDRIsEncodedAsTaggedHEVCMain10() {
+        for intent in PlaybackIntent.allCases {
+            for (codec, transfer) in [("vp9", "smpte2084"), ("av1", "arib-std-b67")] {
+                var source = info(video: codec, audio: "opus", hdr: true)
+                source = MediaInfo(formatName: source.formatName, duration: source.duration,
+                    videoCodec: codec, videoProfile: nil, pixelFormat: "yuv420p10le",
+                    colorTransfer: transfer, isDolbyVision: false, tracks: source.tracks,
+                    colorPrimaries: "bt2020", colorSpace: "bt2020nc")
+                let steps = TranscodePlanner.plan(info: source, intent: intent, selectedAudioID: 2).steps
+                XCTAssertEqual(steps.count, 1, "\(codec) \(intent): no 8-bit H.264 fallback")
+                let step = steps[0]
+                XCTAssertEqual(step.strategy, .hardwareEncode)
+                XCTAssertTrue(step.requiresHVC1)
+                XCTAssertEqual(step.requiredTransfer, transfer)
+                XCTAssertTrue(step.videoArguments.contains("hevc_videotoolbox"))
+                XCTAssertFalse(step.videoArguments.contains("h264_videotoolbox"))
+                let filter = step.videoArguments[step.videoArguments.firstIndex(of: "-vf")! + 1]
+                XCTAssertEqual(filter, "setparams=color_primaries=bt2020:color_trc=\(transfer):colorspace=bt2020nc")
+                let profile = step.videoArguments.firstIndex(of: "-profile:v")!
+                XCTAssertEqual(step.videoArguments[profile + 1], "main10")
+            }
+        }
+    }
+
+    func testHDRColorFilterDefaultsMissingPrimariesAndMatrixToBT2020() {
+        let source = MediaInfo(formatName: "matroska,webm", duration: 1, videoCodec: "vp9",
+            videoProfile: nil, pixelFormat: "yuv420p10le", colorTransfer: "smpte2084",
+            isDolbyVision: false, tracks: [], colorPrimaries: "unknown", colorSpace: nil)
+        XCTAssertEqual(HDRVideoArguments.colorFilter(for: source),
+                       "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc")
+        XCTAssertNil(HDRVideoArguments.colorFilter(for: info(video: "vp9", hdr: false)))
+    }
+
+    func testHEVCHDRAirPlayStepsRequireTransferAndTagTheEncode() {
+        let steps = TranscodePlanner.plan(info: info(hdr: true), intent: .airPlay).steps
+        // The 5.1 AAC source is copied first; the last encode re-encodes it.
+        XCTAssertEqual(steps.map(\.strategy), [.hdrRemux, .hardwareEncode, .hardwareEncode])
+        XCTAssertEqual(steps.map(\.requiredTransfer), ["smpte2084", "smpte2084", "smpte2084"])
+        XCTAssertTrue(steps[1].videoArguments.contains("-vf"))
+        XCTAssertEqual(steps[1].audioArguments, ["-c:a", "copy"])
+        XCTAssertEqual(steps[2].audioArguments, ["-c:a", "eac3", "-ac:a", "6", "-b:a", "640k"])
+    }
+
+    func testTransferNamesMapToCoreMediaValues() {
+        XCTAssertEqual(MediaArtifactValidator.coreMediaTransferFunction(forFFmpegName: "smpte2084"),
+                       kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String)
+        XCTAssertEqual(MediaArtifactValidator.coreMediaTransferFunction(forFFmpegName: "arib-std-b67"),
+                       kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String)
+        XCTAssertNil(MediaArtifactValidator.coreMediaTransferFunction(forFFmpegName: "bt709"))
+    }
+
+    func testValidatorRejectsOutputThatLostHDRTransfer() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("sdr.mp4")
+        try await writeGeneratedSDRMovie(to: url)
+
+        let sdr = await MediaArtifactValidator.validate(url, sourceHadAudio: false)
+        XCTAssertTrue(sdr.isValid, sdr.reason ?? "")
+        let hdr = await MediaArtifactValidator.validate(url, sourceHadAudio: false, requiredTransfer: "smpte2084")
+        XCTAssertFalse(hdr.isValid)
+        XCTAssertEqual(hdr.reason, "Output lost the source's HDR transfer function.")
+    }
+
+    func testValidatorRejectsOutputWithoutDolbyVisionSampleEntry() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("plain.mp4")
+        try await writeGeneratedSDRMovie(to: url)
+
+        let result = await MediaArtifactValidator.validate(url, sourceHadAudio: false, requiresDolbyVision: true)
+        XCTAssertFalse(result.isValid)
+        XCTAssertEqual(result.reason, "Output lost its Dolby Vision dvh1 sample entry or configuration.")
+        let flags = await VideoFormatProbe.inspect(AVURLAsset(url: url))
+        XCTAssertTrue(flags.isEmpty)
+    }
+
+    /// Writes a 10-frame, 64×64 H.264 movie tagged BT.709 with AVAssetWriter.
+    private func writeGeneratedSDRMovie(to url: URL) async throws {
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: 64, AVVideoHeightKey: 64,
+            AVVideoColorPropertiesKey: [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2]])
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input,
+            sourcePixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                                          kCVPixelBufferWidthKey as String: 64, kCVPixelBufferHeightKey as String: 64])
+        writer.add(input)
+        XCTAssertTrue(writer.startWriting())
+        writer.startSession(atSourceTime: .zero)
+        for frame in 0..<10 {
+            while !input.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 1_000_000) }
+            var buffer: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, adaptor.pixelBufferPool!, &buffer)
+            let pixels = try XCTUnwrap(buffer)
+            CVPixelBufferLockBaseAddress(pixels, [])
+            memset(CVPixelBufferGetBaseAddress(pixels), Int32(frame * 20), CVPixelBufferGetDataSize(pixels))
+            CVPixelBufferUnlockBaseAddress(pixels, [])
+            XCTAssertTrue(adaptor.append(pixels, withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: 10)))
+        }
+        input.markAsFinished()
+        await writer.finishWriting()
+        XCTAssertEqual(writer.status, .completed, writer.error?.localizedDescription ?? "")
     }
 
     func testExplicitAudioMappingUsesAbsoluteStreamIndex() throws {
@@ -131,7 +627,9 @@ final class AirPlayDropTests: XCTestCase {
             output: URL(fileURLWithPath: "/out.mp4"), step: step,
             selection: TrackSelection(audioID: 2, subtitleID: nil), sourceHasAudio: true)
         XCTAssertTrue(args.windows(ofCount: 2).contains { Array($0) == ["-map", "0:2"] })
-        XCTAssertTrue(args.contains("aac"))
+        // The fixture's audio is 6-channel, so it is converted to E-AC3 5.1.
+        XCTAssertTrue(args.windows(ofCount: 2).contains { Array($0) == ["-c:a", "eac3"] })
+        XCTAssertTrue(args.windows(ofCount: 2).contains { Array($0) == ["-ac:a", "6"] })
         XCTAssertEqual(args.last, "/out.mp4")
     }
 
@@ -170,6 +668,562 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertEqual(mapped.audioTracks.first?.id, 3)
         XCTAssertTrue(mapped.isHDR)
         XCTAssertTrue(mapped.isDolbyVision)
+    }
+
+    // The side-data fixtures below are verbatim FFprobe 9.0.2 JSON from tiny
+    // clips generated with the lavfi testsrc2 source (no user media). FFprobe
+    // emits numeric values here, which previously failed the entire decode.
+
+    func testProbeParsesNumericRotationSideData() throws {
+        let data = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","profile":"Main 10","pix_fmt":"yuv420p10le","side_data_list":[{"side_data_type":"Display Matrix","displaymatrix":"\n00000000:            0      -65536           0\n00000001:        65536           0           0\n00000002:            0           0  1073741824\n","rotation":90}],"disposition":{"default":1,"forced":0}}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"1.000000"}}"#.data(using: .utf8)!
+        let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))
+        XCTAssertEqual(mapped.rotation, 90)
+        XCTAssertFalse(mapped.isDolbyVision)
+        XCTAssertEqual(mapped.videoCodec, "hevc")
+    }
+
+    func testProbeParsesNumericHDRLightLevelSideData() throws {
+        let data = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","profile":"Main 10","pix_fmt":"yuv420p10le","color_transfer":"smpte2084","side_data_list":[{"side_data_type":"Mastering display metadata","red_x":"34000/50000","red_y":"16000/50000","green_x":"13250/50000","green_y":"34500/50000","blue_x":"7500/50000","blue_y":"3000/50000","white_point_x":"15635/50000","white_point_y":"16450/50000","min_luminance":"1/10000","max_luminance":"10000000/10000"},{"side_data_type":"Content light level metadata","max_content":1000,"max_average":400}],"disposition":{"default":1,"forced":0}}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"1.000000"}}"#.data(using: .utf8)!
+        let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))
+        XCTAssertTrue(mapped.isHDR)
+        XCTAssertFalse(mapped.isDolbyVision)
+        XCTAssertNil(mapped.rotation)
+    }
+
+    func testProbeParsesDolbyVisionConfigurationProfile() throws {
+        // Field names and types match ffprobe.c print_int/print_str output
+        // for AV_PKT_DATA_DOVI_CONF.
+        let data = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","profile":"Main 10","pix_fmt":"yuv420p10le","color_transfer":"smpte2084","side_data_list":[{"side_data_type":"DOVI configuration record","dv_version_major":1,"dv_version_minor":0,"dv_profile":5,"dv_level":6,"rpu_present_flag":1,"el_present_flag":0,"bl_present_flag":1,"dv_bl_signal_compatibility_id":0,"dv_md_compression":"none"}],"disposition":{"default":1}}],"format":{"format_name":"matroska,webm","duration":"10.0"}}"#.data(using: .utf8)!
+        let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))
+        XCTAssertTrue(mapped.isDolbyVision)
+        XCTAssertEqual(mapped.dolbyVisionProfile, 5)
+        XCTAssertEqual(mapped.dolbyVisionCompatibilityID, 0)
+    }
+
+    func testProbeParsesDualLayerDolbyVisionProfile7() throws {
+        // Field names and types match ffprobe.c output for AV_PKT_DATA_DOVI_CONF;
+        // values are those of a UHD Blu-ray profile 7 stream (BL + EL + RPU).
+        let data = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","profile":"Main 10","pix_fmt":"yuv420p10le","color_transfer":"smpte2084","side_data_list":[{"side_data_type":"DOVI configuration record","dv_version_major":1,"dv_version_minor":0,"dv_profile":7,"dv_level":6,"rpu_present_flag":1,"el_present_flag":1,"bl_present_flag":1,"dv_bl_signal_compatibility_id":6,"dv_md_compression":"none"}],"disposition":{"default":1}}],"format":{"format_name":"matroska,webm","duration":"10.0"}}"#.data(using: .utf8)!
+        let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))
+        XCTAssertEqual(mapped.dolbyVisionProfile, 7)
+        XCTAssertEqual(mapped.dolbyVisionCompatibilityID, 6)
+        XCTAssertEqual(mapped.dolbyVisionHasEnhancementLayer, true)
+        XCTAssertTrue(mapped.isDualLayerDolbyVision)
+    }
+
+    func testDualLayerDolbyVisionRemuxStripsEnhancementLayerAndRPU() {
+        var profile7 = info(hdr: true, dolbyVision: true)
+        profile7.dolbyVisionProfile = 7
+        profile7.dolbyVisionHasEnhancementLayer = true
+        let plan = TranscodePlanner.plan(info: profile7, intent: .airPlay, selectedAudioID: 2)
+        XCTAssertEqual(plan.reason, "Dual-layer Dolby Vision (profile 7) plays on Apple TV only as its HDR10 base layer.")
+        let remux = plan.steps[0]
+        XCTAssertEqual(remux.strategy, .hdrRemux)
+        XCTAssertEqual(remux.videoArguments, ["-c:v", "copy", "-bsf:v", "filter_units=remove_types=62|63", "-tag:v", "hvc1"])
+        XCTAssertTrue(remux.reason.contains("enhancement layer"))
+        XCTAssertEqual(remux.requiredTransfer, "smpte2084")
+
+        // A profile 7 record without el_present_flag is still dual-layer.
+        var profileOnly = info(hdr: true, dolbyVision: true)
+        profileOnly.dolbyVisionProfile = 7
+        XCTAssertTrue(profileOnly.isDualLayerDolbyVision)
+
+        var profile8 = info(hdr: true, dolbyVision: true)
+        profile8.dolbyVisionProfile = 8
+        profile8.dolbyVisionHasEnhancementLayer = false
+        XCTAssertFalse(profile8.isDualLayerDolbyVision)
+        let single = TranscodePlanner.plan(info: profile8, intent: .airPlay, selectedAudioID: 2)
+        XCTAssertEqual(single.reason, "Dolby Vision needs an Apple TV compatible HDR10 fallback.")
+        XCTAssertEqual(single.steps[0].videoArguments, remux.videoArguments)
+        XCTAssertFalse(info(hdr: true).isDualLayerDolbyVision)
+    }
+
+    private func profile5(format: String = "matroska,webm") -> MediaInfo {
+        var source = info(format: format, hdr: true, dolbyVision: true)
+        source.dolbyVisionProfile = 5
+        source.dolbyVisionCompatibilityID = 0
+        return source
+    }
+
+    func testDolbyVisionProfile5IsKeptAsDolbyVisionWithoutEncodeFallback() {
+        for intent in [PlaybackIntent.airPlay, .local] {
+            let plan = TranscodePlanner.plan(info: profile5(), intent: intent, selectedAudioID: 2)
+            XCTAssertEqual(plan.reason, "Dolby Vision profile 5 has no HDR10 base layer, so it is kept as Dolby Vision in a dvh1 MP4.")
+            // Copy surround first, then retry with encoded audio; never re-encode video.
+            XCTAssertEqual(plan.steps.map(\.strategy), [.dolbyVisionRemux, .dolbyVisionRemux])
+            for step in plan.steps {
+                XCTAssertEqual(step.videoArguments, ["-c:v", "copy", "-tag:v", "dvh1", "-strict", "unofficial"])
+                XCTAssertTrue(step.requiresDolbyVision)
+                XCTAssertFalse(step.requiresHVC1)
+                XCTAssertFalse(step.videoArguments.contains("filter_units=remove_types=62|63"))
+            }
+            XCTAssertEqual(plan.steps[0].audioArguments, ["-c:a", "copy"])
+            XCTAssertEqual(plan.steps[1].audioArguments, ["-c:a", "eac3", "-ac:a", "6", "-b:a", "640k"])
+        }
+        // Late Night still keeps the video as Dolby Vision.
+        let lateNight = TranscodePlanner.plan(info: profile5(), intent: .airPlay, selectedAudioID: 2,
+                                              audioProcessingMode: .lateNight)
+        XCTAssertEqual(lateNight.steps.map(\.strategy), [.dolbyVisionRemux])
+        XCTAssertEqual(lateNight.steps[0].audioArguments, AudioArguments.stereo)
+
+        // Profile 8 and unknown profiles keep the HDR10 base-layer remux.
+        var profile8 = info(hdr: true, dolbyVision: true)
+        profile8.dolbyVisionProfile = 8
+        XCTAssertFalse(profile8.isDolbyVisionProfile5)
+        XCTAssertEqual(TranscodePlanner.plan(info: profile8, intent: .airPlay).steps.first?.strategy, .hdrRemux)
+        XCTAssertEqual(TranscodePlanner.plan(info: info(hdr: true, dolbyVision: true), intent: .airPlay).steps.first?.strategy, .hdrRemux)
+    }
+
+    func testDolbyVisionPassthroughArgumentsKeepStrictForMuxerAndSubtitles() throws {
+        let step = TranscodePlanner.plan(info: profile5(), intent: .airPlay, selectedAudioID: 2).steps[1]
+        var selection = TrackSelection(audioID: 2)
+        selection.subtitle = .embedded(streamID: 3)
+        selection.subtitlePolicy = .includeSelected
+        let args = try TranscodeService.ffmpegArguments(input: URL(fileURLWithPath: "/in.mkv"),
+            output: URL(fileURLWithPath: "/out.mp4"), step: step, selection: selection, sourceHasAudio: true)
+        let strict = try XCTUnwrap(args.firstIndex(of: "-strict"))
+        XCTAssertEqual(args[strict + 1], "unofficial")
+        XCTAssertGreaterThan(strict, try XCTUnwrap(args.firstIndex(of: "-i")))
+        XCTAssertEqual(args[try XCTUnwrap(args.firstIndex(of: "-tag:v")) + 1], "dvh1")
+        XCTAssertTrue(args.contains("mov_text"))
+        XCTAssertEqual(args.last, "/out.mp4")
+    }
+
+    func testCachedCopyMustMatchDolbyVisionRequirement() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("source.mkv")
+        let output = directory.appendingPathComponent("source_airplay.mp4")
+        try Data("source".utf8).write(to: source)
+        try Data("output".utf8).write(to: output)
+        // A copy made before passthrough existed has no Dolby Vision requirement.
+        try MediaArtifactValidator.writeManifest(source: source, artifact: output, sourceHadAudio: true,
+            selectedAudioID: nil, expectedDuration: nil, requiresHVC1: true)
+        let stale = await MediaArtifactValidator.validateCached(output, source: source, expectedDolbyVision: true)
+        XCTAssertEqual(stale.reason, "No current artifact manifest")
+
+        try MediaArtifactValidator.writeManifest(source: source, artifact: output, sourceHadAudio: true,
+            selectedAudioID: nil, expectedDuration: nil, requiresHVC1: false, requiresDolbyVision: true)
+        let manifest = try JSONDecoder().decode(MediaArtifactManifest.self,
+            from: Data(contentsOf: MediaArtifactValidator.manifestURL(for: output)))
+        XCTAssertEqual(manifest.requiresDolbyVision, true)
+        // The manifest now matches, so validation reaches the (unplayable) file itself.
+        let current = await MediaArtifactValidator.validateCached(output, source: source, expectedDolbyVision: true)
+        XCTAssertNotEqual(current.reason, "No current artifact manifest")
+        let mismatch = await MediaArtifactValidator.validateCached(output, source: source)
+        XCTAssertEqual(mismatch.reason, "No current artifact manifest")
+    }
+
+    private func interlaced(_ codec: String = "h264", width: Int = 1920, height: Int = 1080,
+                            frameRate: String = "25/1", fieldOrder: String = "tt", hdr: Bool = false) -> MediaInfo {
+        var source = video(codec, profile: codec == "h264" ? "High" : nil, pixelFormat: "yuv420p",
+                           width: width, height: height, frameRate: frameRate, hdr: hdr)
+        source.fieldOrder = fieldOrder
+        return source
+    }
+
+    func testProbeMapsInterlacedFieldOrder() throws {
+        // Verbatim FFprobe 9.0.2 fields from a generated top-field-first 1080i25 libx264 clip.
+        let data = #"{"streams":[{"index":0,"codec_name":"h264","profile":"Main","codec_type":"video","width":1920,"height":1080,"pix_fmt":"yuv420p","field_order":"tt","avg_frame_rate":"25/1"}],"format":{"format_name":"mpegts","duration":"2.023222"}}"#.data(using: .utf8)!
+        let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))
+        XCTAssertEqual(mapped.fieldOrder, "tt")
+        XCTAssertTrue(mapped.isInterlaced)
+        XCTAssertEqual(mapped.deinterlacedAverageFrameRate, "50/1")
+        XCTAssertEqual(AppleTVVideoCompatibility.issues(for: mapped), [.interlaced("tt")])
+        XCTAssertEqual(AppleTVVideoCompatibility.reason(for: [.interlaced("tt")]),
+                       "Apple TV cannot play interlaced video streamed over AirPlay.")
+        for order in ["progressive", "unknown"] {
+            let source = interlaced(fieldOrder: order)
+            XCTAssertFalse(source.isInterlaced)
+            XCTAssertEqual(source.deinterlacedAverageFrameRate, "25/1")
+            XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(source))
+        }
+        XCTAssertTrue(interlaced(fieldOrder: "bb").isInterlaced)
+    }
+
+    func testAirPlayPlanDeinterlacesToDoubleRate() throws {
+        let plan = TranscodePlanner.plan(info: interlaced(), intent: .airPlay, selectedAudioID: 2)
+        XCTAssertEqual(plan.reason, "Apple TV cannot play interlaced video streamed over AirPlay.")
+        XCTAssertEqual(plan.steps.map(\.strategy), [.hardwareEncode, .hardwareEncode])
+        // 25i becomes 50p, so the 1080p rate gets the higher-frame-rate increase.
+        XCTAssertEqual(plan.steps[0].videoArguments, ["-vf", "bwdif=mode=send_field:parity=auto:deint=all,format=yuv420p",
+                                                      "-c:v", "h264_videotoolbox", "-b:v", "10400k"])
+        // 29.97i becomes 59.94p, within the 60 fps limit, so there is no -r cap.
+        let ntsc = TranscodePlanner.plan(info: interlaced(frameRate: "30000/1001"), intent: .airPlay, selectedAudioID: 2).steps[0]
+        XCTAssertFalse(ntsc.videoArguments.contains("-r"))
+        XCTAssertEqual(ntsc.videoArguments.last, "11692k")
+        // Interlaced HDR is deinterlaced before the colour tags are set.
+        let hdr = TranscodePlanner.plan(info: interlaced("hevc", hdr: true), intent: .airPlay, selectedAudioID: 2).steps[0]
+        XCTAssertEqual(hdr.videoArguments[1],
+            "bwdif=mode=send_field:parity=auto:deint=all,setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc")
+    }
+
+    func testLocalPlanCopiesInterlacedVideoButDeinterlacesEncodes() {
+        let local = TranscodePlanner.plan(info: interlaced(), intent: .local, selectedAudioID: 2,
+                                          requiresSubtitleMuxing: true).steps
+        XCTAssertEqual(local.first?.videoArguments, ["-c:v", "copy"])
+        XCTAssertTrue(local.last!.videoArguments[1].hasPrefix("bwdif="))
+        // MPEG-2 576i: 414,720 pixels scale the 540p rung, then 50p adds a third.
+        let dvd = TranscodePlanner.plan(info: interlaced("mpeg2video", width: 720, height: 576), intent: .local,
+                                        selectedAudioID: 2).steps[0]
+        XCTAssertEqual(dvd.videoArguments, ["-vf", "bwdif=mode=send_field:parity=auto:deint=all,format=yuv420p",
+                                            "-c:v", "h264_videotoolbox", "-b:v", "2133k"])
+        // Without a deinterlacer the encode still runs, as before.
+        let none = TranscodePlanner.plan(info: interlaced(), intent: .airPlay, selectedAudioID: 2,
+                                         deinterlaceFilter: nil).steps[0]
+        XCTAssertEqual(none.videoArguments[1], "format=yuv420p")
+        XCTAssertFalse(TranscodePlanner.plan(info: video("h264", profile: "High", pixelFormat: "yuv420p"),
+            intent: .local, selectedAudioID: 2, requiresSubtitleMuxing: true).steps.last!.videoArguments[1].contains("bwdif"))
+    }
+
+    func testParseFilterNamesAndChooseDeinterlacer() {
+        let text = """
+        Filters:
+          T.. = Timeline support
+          .S. = Slice threading
+          A = Audio input/output
+          | = Source or sink filter
+         TS bwdif             V->V       Deinterlace the input image.
+         .. setparams         V->V       Force field, or color property for the output video frame.
+         T. acompressor       A->A       Audio compressor.
+        """
+        let names = TranscodeService.parseFilterNames(text)
+        XCTAssertEqual(names, ["bwdif", "setparams", "acompressor"])
+        XCTAssertEqual(TranscodeService.deinterlaceFilter(available: names), Deinterlace.filter)
+        XCTAssertEqual(TranscodeService.deinterlaceFilter(available: ["yadif"]),
+                       "yadif=mode=send_field:parity=auto:deint=all")
+        XCTAssertNil(TranscodeService.deinterlaceFilter(available: ["scale"]))
+    }
+
+    private func withPGS(_ source: MediaInfo) -> MediaInfo {
+        var info = source
+        info = MediaInfo(formatName: info.formatName, duration: info.duration, videoCodec: info.videoCodec,
+            videoProfile: info.videoProfile, pixelFormat: info.pixelFormat, colorTransfer: info.colorTransfer,
+            isDolbyVision: info.isDolbyVision, tracks: info.tracks + [
+                MediaTrack(id: 3, kind: .subtitle, codec: "hdmv_pgs_subtitle", language: "eng", title: nil,
+                           channels: nil, isDefault: false, isTextSubtitle: false),
+                MediaTrack(id: 4, kind: .subtitle, codec: "subrip", language: "eng", title: nil,
+                           channels: nil, isDefault: false, isTextSubtitle: true)],
+            dolbyVisionProfile: info.dolbyVisionProfile, colorPrimaries: info.colorPrimaries,
+            colorSpace: info.colorSpace, width: info.width, height: info.height,
+            averageFrameRate: info.averageFrameRate, fieldOrder: info.fieldOrder)
+        return info
+    }
+
+    func testBitmapSubtitleSelectionBecomesBurnIn() {
+        let source = withPGS(video("h264", profile: "High", pixelFormat: "yuv420p"))
+        XCTAssertTrue(source.subtitleTracks[0].isBitmapSubtitle)
+        XCTAssertFalse(source.subtitleTracks[1].isBitmapSubtitle)
+        let pgs = TrackSelection(audioID: 2, subtitleID: 3, subtitlePolicy: .includeSelected)
+        XCTAssertEqual(SubtitleBurnIn.selected(in: source, selection: pgs,
+            syncAdjustment: SyncAdjustment(audioMilliseconds: 0, subtitleMilliseconds: -250)),
+            SubtitleBurnIn(streamID: 3, offsetSeconds: -0.25))
+        XCTAssertNil(SubtitleBurnIn.selected(in: source, selection: TrackSelection(audioID: 2, subtitleID: 4,
+                                                                                   subtitlePolicy: .includeSelected)))
+        XCTAssertNil(SubtitleBurnIn.selected(in: source, selection: TrackSelection(audioID: 2, subtitleID: 3)))
+        // Automatic selection stays text-only, so a bitmap track never forces an encode by default.
+        var preferences = PlaybackPreferences()
+        preferences.subtitleDefaultMode = .preferred
+        preferences.preferredSubtitleLanguages = ["en"]
+        XCTAssertEqual(FFprobeService.defaultSelection(from: source, preferences: preferences).subtitleID, 4)
+    }
+
+    func testBurnInPlansNeverCopyVideoAndUseOneFilterGraph() {
+        let burn = SubtitleBurnIn(streamID: 3)
+        let sdr = withPGS(video("h264", profile: "High", pixelFormat: "yuv420p"))
+        for intent in [PlaybackIntent.local, .airPlay] {
+            for mode in [AudioProcessingMode.standard, .lateNight] {
+                let plan = TranscodePlanner.plan(info: sdr, intent: intent, selectedAudioID: 2,
+                    audioProcessingMode: mode, requiresSubtitleMuxing: true, burnInSubtitle: burn)
+                XCTAssertEqual(plan.reason, "The selected bitmap subtitle is burned into the video, which needs a full video encode.")
+                XCTAssertFalse(plan.steps.isEmpty)
+                for step in plan.steps {
+                    XCTAssertEqual(step.strategy, .hardwareEncode)
+                    XCTAssertTrue(step.burnsInSubtitle)
+                    XCTAssertFalse(step.videoArguments.contains("copy"))
+                    XCTAssertFalse(step.videoArguments.contains("-vf"))
+                }
+            }
+        }
+        let step = TranscodePlanner.plan(info: sdr, intent: .airPlay, selectedAudioID: 2, burnInSubtitle: burn).steps[0]
+        XCTAssertEqual(step.videoArguments, ["-filter_complex",
+            "[0:v:0]null[base];[1:3]null[sub];[base][sub]overlay=x=(W-w)/2:y=H-h:eof_action=pass:format=auto,format=yuv420p[v]",
+            "-c:v", "h264_videotoolbox", "-b:v", "7800k"])
+    }
+
+    func testBurnInGraphOrdersDeinterlaceOverlayScaleAndDimsHDR() {
+        var hdr = withPGS(video("hevc", profile: "Main 10", pixelFormat: "yuv420p10le", width: 7680, height: 4320,
+                                frameRate: "25/1", hdr: false))
+        hdr = MediaInfo(formatName: hdr.formatName, duration: hdr.duration, videoCodec: "hevc", videoProfile: "Main 10",
+            pixelFormat: "yuv420p10le", colorTransfer: "smpte2084", isDolbyVision: false, tracks: hdr.tracks,
+            width: 7680, height: 4320, averageFrameRate: "25/1", fieldOrder: "tt")
+        let plan = TranscodePlanner.plan(info: hdr, intent: .airPlay, selectedAudioID: 2,
+                                         burnInSubtitle: SubtitleBurnIn(streamID: 3, offsetSeconds: 0.4))
+        XCTAssertFalse(plan.steps.contains { $0.strategy == .hdrRemux })
+        let graph = plan.steps[0].videoArguments[1]
+        XCTAssertEqual(graph,
+            "[0:v:0]bwdif=mode=send_field:parity=auto:deint=all[base];"
+            + "[1:3]setpts=PTS+0.400/TB,colorchannelmixer=rr=0.58:gg=0.58:bb=0.58[sub];"
+            + "[base][sub]overlay=x=(W-w)/2:y=H-h:eof_action=pass:format=auto,"
+            + "scale=w=4096:h=2160:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            + "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc[v]")
+        XCTAssertEqual(SubtitleBurnIn.hdrGraphicsScale(for: "arib-std-b67"), 0.75)
+        XCTAssertNil(SubtitleBurnIn.hdrGraphicsScale(for: nil))
+    }
+
+    func testBurnInArgumentsMapGraphOutputAndDropSubtitleStream() throws {
+        let sdr = withPGS(video("h264", profile: "High", pixelFormat: "yuv420p"))
+        let step = TranscodePlanner.plan(info: sdr, intent: .local, selectedAudioID: 2,
+                                         burnInSubtitle: SubtitleBurnIn(streamID: 3)).steps[0]
+        let selection = TrackSelection(audioID: 2, subtitleID: 3, subtitlePolicy: .includeSelected)
+        let args = try TranscodeService.ffmpegArguments(input: URL(fileURLWithPath: "/in.mkv"),
+            output: URL(fileURLWithPath: "/out.mp4"), step: step, selection: selection, sourceHasAudio: true,
+            syncAdjustment: SyncAdjustment(audioMilliseconds: 0, subtitleMilliseconds: 400))
+        let maps = args.indices.filter { args[$0] == "-map" }.map { args[$0 + 1] }
+        XCTAssertEqual(maps, ["[v]", "0:2"])
+        XCTAssertTrue(args.contains("-filter_complex"))
+        // The subtitle is read from a second input of the same file.
+        XCTAssertEqual(args.indices.filter { args[$0] == "-i" }.map { args[$0 + 1] }, ["/in.mkv", "/in.mkv"])
+        XCTAssertTrue(args.contains("-sn"))
+        XCTAssertFalse(args.contains("mov_text"))
+        XCTAssertFalse(args.contains("-bsf:s"))
+        XCTAssertEqual(Array(args.suffix(3)), ["-movflags", "+faststart", "/out.mp4"])
+    }
+
+    private let toneMapChain = "format=p010le,hwupload,scale_vt=color_matrix=bt709:color_primaries=bt709:color_transfer=bt709,hwdownload,format=p010le"
+
+    func testSDRReceiverRulesAcceptOnly1080pSDRH264() {
+        let receiver = AirPlayReceiver.sdrH264
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("h264", profile: "High", pixelFormat: "yuv420p"),
+                                                             receiver: receiver))
+        XCTAssertEqual(AppleTVVideoCompatibility.issues(for: video("hevc", profile: "Main", pixelFormat: "yuv420p"),
+                                                        receiver: receiver), [.codec("hevc")])
+        XCTAssertEqual(AppleTVVideoCompatibility.issues(for: video("h264", profile: "High", pixelFormat: "yuv420p",
+            width: 3840, height: 2160), receiver: receiver), [.resolution(width: 3840, height: 2160)])
+        XCTAssertEqual(AppleTVVideoCompatibility.issues(for: video("h264", profile: "High", pixelFormat: "yuv420p",
+            hdr: true), receiver: receiver), [.hdr])
+        XCTAssertEqual(AppleTVVideoCompatibility.reason(for: [.hdr], receiver: receiver),
+                       "The SDR AirPlay receiver cannot play HDR video streamed over AirPlay.")
+        // The Apple TV 4K rules are unchanged.
+        XCTAssertTrue(AppleTVVideoCompatibility.isCompatible(video("hevc", profile: "Main 10",
+            pixelFormat: "yuv420p10le", width: 3840, height: 2160, hdr: true)))
+    }
+
+    func testSDRReceiverPlanToneMapsHDRToH264At1080p() {
+        let hdr4K = MediaInfo(formatName: "matroska,webm", duration: 120, videoCodec: "hevc", videoProfile: "Main 10",
+            pixelFormat: "yuv420p10le", colorTransfer: "smpte2084", isDolbyVision: false,
+            tracks: [audioTrack("eac3", channels: 6)], width: 3840, height: 2160, averageFrameRate: "24000/1001")
+        let plan = TranscodePlanner.plan(info: hdr4K, intent: .airPlay, selectedAudioID: 2, receiver: .sdrH264)
+        XCTAssertEqual(plan.reason, "The SDR AirPlay receiver cannot play HEVC video, 3840×2160 resolution, HDR video streamed over AirPlay.")
+        XCTAssertEqual(plan.steps.map(\.strategy), [.hardwareEncode, .hardwareEncode])
+        XCTAssertEqual(plan.steps[0].videoArguments, ["-vf",
+            toneMapChain + ",scale=w=1920:h=1080:force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p",
+            "-c:v", "h264_videotoolbox", "-b:v", "7800k"])
+        XCTAssertNil(plan.steps[0].requiredTransfer)
+        XCTAssertEqual(plan.steps[0].audioArguments, ["-c:a", "copy"])
+        // The same source for an Apple TV 4K keeps HDR with the lossless remux first.
+        XCTAssertEqual(TranscodePlanner.plan(info: hdr4K, intent: .airPlay, selectedAudioID: 2).steps.first?.strategy, .hdrRemux)
+        // Local playback ignores the receiver.
+        XCTAssertEqual(TranscodePlanner.plan(info: hdr4K, intent: .local, selectedAudioID: 2, receiver: .sdrH264),
+                       TranscodePlanner.plan(info: hdr4K, intent: .local, selectedAudioID: 2))
+    }
+
+    func testLocalH264FallbackToneMapsHDR() {
+        let hdr = MediaInfo(formatName: "matroska,webm", duration: 120, videoCodec: "hevc", videoProfile: "Main 10",
+            pixelFormat: "yuv420p10le", colorTransfer: "arib-std-b67", isDolbyVision: false,
+            tracks: [audioTrack("aac", channels: 2)], width: 1920, height: 1080, averageFrameRate: "25/1")
+        let last = TranscodePlanner.plan(info: hdr, intent: .local, selectedAudioID: 2,
+                                         requiresSubtitleMuxing: true).steps.last!
+        XCTAssertEqual(last.videoArguments.prefix(2), ["-vf", toneMapChain + ",format=yuv420p"])
+        XCTAssertEqual(ToneMap.inputArguments(for: last), ["-init_hw_device", "videotoolbox=vt", "-filter_hw_device", "vt"])
+        let remux = TranscodePlanner.plan(info: hdr, intent: .local, selectedAudioID: 2,
+                                          requiresSubtitleMuxing: true).steps.first!
+        XCTAssertEqual(remux.strategy, .remux)
+        XCTAssertEqual(ToneMap.inputArguments(for: remux), [])
+        // Without the filters the old untagged fallback remains.
+        let untoned = TranscodePlanner.plan(info: hdr, intent: .local, selectedAudioID: 2,
+                                            requiresSubtitleMuxing: true, canToneMap: false).steps.last!
+        XCTAssertEqual(untoned.videoArguments.prefix(2), ["-vf", "format=yuv420p"])
+        // Burned-in subtitles go on after tone mapping, so they are not dimmed.
+        let burned = TranscodePlanner.plan(info: withPGS(hdr), intent: .airPlay, selectedAudioID: 2,
+            burnInSubtitle: SubtitleBurnIn(streamID: 3), receiver: .sdrH264).steps[0]
+        XCTAssertEqual(burned.videoArguments[1], "[0:v:0]" + toneMapChain + "[base];[1:3]null[sub];"
+            + "[base][sub]overlay=x=(W-w)/2:y=H-h:eof_action=pass:format=auto,format=yuv420p[v]")
+    }
+
+    func testAirPlayCopyIsTiedToItsReceiver() {
+        let item = MediaItem(fileURL: URL(fileURLWithPath: "/tmp/HDR.mkv"))
+        item.mediaInfo = info(hdr: true)
+        XCTAssertTrue(item.needsAirPlayTranscode(for: .appleTV4K))
+        XCTAssertTrue(item.needsAirPlayTranscode(for: .sdrH264))
+        let copy = URL(fileURLWithPath: "/tmp/HDR_airplay.mp4")
+        item.transcodedURL = copy
+        item.playbackIntent = .airPlay
+        item.isAirPlayPrepared = true
+        item.preparedReceiver = .appleTV4K
+        item.preparedCopyInfo = (copy, info(format: "mov,mp4,m4a,3gp,3g2,mj2", hdr: true))
+        XCTAssertFalse(item.needsAirPlayTranscode(for: .appleTV4K))
+        // An HDR copy made for an Apple TV 4K must be prepared again for an SDR receiver.
+        XCTAssertTrue(item.needsAirPlayTranscode(for: .sdrH264))
+        item.preparedReceiver = .sdrH264
+        item.preparedCopyInfo = (copy, video("h264", profile: "High", pixelFormat: "yuv420p"))
+        XCTAssertFalse(item.needsAirPlayTranscode(for: .sdrH264))
+    }
+
+    func testAirPlayReceiverPreferenceAndManifest() async throws {
+        var preferences = PlaybackPreferences()
+        XCTAssertEqual(preferences.airPlayReceiver, .appleTV4K)
+        preferences.airPlayReceiver = .sdrH264
+        let decoded = try JSONDecoder().decode(PlaybackPreferences.self, from: JSONEncoder().encode(preferences))
+        XCTAssertEqual(decoded.airPlayReceiver, .sdrH264)
+        let legacy = try JSONDecoder().decode(PlaybackPreferences.self,
+            from: Data(#"{"schemaVersion":1,"preferredAudioLanguages":["en"],"subtitleDefaultMode":"off"}"#.utf8))
+        XCTAssertEqual(legacy.airPlayReceiver, .appleTV4K)
+
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("source.mkv")
+        let output = directory.appendingPathComponent("source_airplay.mp4")
+        try Data("source".utf8).write(to: source)
+        try Data("output".utf8).write(to: output)
+        try MediaArtifactValidator.writeManifest(source: source, artifact: output, sourceHadAudio: true,
+            selectedAudioID: nil, expectedDuration: nil, requiresHVC1: false, playbackIntent: .airPlay,
+            airPlayReceiver: .sdrH264)
+        let manifest = try JSONDecoder().decode(MediaArtifactManifest.self,
+            from: Data(contentsOf: MediaArtifactValidator.manifestURL(for: output)))
+        XCTAssertEqual(manifest.airPlayReceiver, .sdrH264)
+        let wrongReceiver = await MediaArtifactValidator.validateCached(output, source: source, expectedIntent: .airPlay)
+        XCTAssertEqual(wrongReceiver.reason, "No current artifact manifest")
+        let sameReceiver = await MediaArtifactValidator.validateCached(output, source: source, expectedIntent: .airPlay,
+                                                                       expectedReceiver: .sdrH264)
+        XCTAssertNotEqual(sameReceiver.reason, "No current artifact manifest")
+    }
+
+    func testFilterEscapingHandlesSpecialCharactersInPaths() {
+        // The same value FFmpeg 9.0.2 accepted for a sidecar at this path in a generated test.
+        XCTAssertEqual(FilterEscaping.value(#"/tmp/odd dir, [x]/it's [a], b; c:d \ e.srt"#),
+                       #"/tmp/odd dir\, \[x\]/it\\\'s \[a\]\, b\; c\\:d \\\\ e.srt"#)
+        XCTAssertEqual(FilterEscaping.value("/Movies/Plain.mkv"), "/Movies/Plain.mkv")
+    }
+
+    func testTextSubtitleBurnInFollowsPolicy() throws {
+        let source = withPGS(video("h264", profile: "High", pixelFormat: "yuv420p"))
+        let input = URL(fileURLWithPath: "/Movies/Film.mkv")
+        let soft = TrackSelection(audioID: 2, subtitleID: 4, subtitlePolicy: .includeSelected)
+        XCTAssertNil(SubtitleBurnIn.selected(in: source, selection: soft, input: input))
+        let burned = TrackSelection(audioID: 2, subtitleID: 4, subtitlePolicy: .burnInSelected)
+        XCTAssertTrue(burned.hasSelectedSubtitle)
+        XCTAssertEqual(SubtitleBurnIn.selected(in: source, selection: burned,
+            syncAdjustment: SyncAdjustment(subtitleMilliseconds: 400), input: input),
+            SubtitleBurnIn(source: .text(path: "/Movies/Film.mkv", subtitleIndex: 1, isASS: false), offsetSeconds: 0.4))
+        // Embedded text needs the source path for libass.
+        XCTAssertNil(SubtitleBurnIn.selected(in: source, selection: burned))
+        // Bitmap tracks burn in whatever the policy.
+        XCTAssertTrue(SubtitleBurnIn.selected(in: source, selection: TrackSelection(audioID: 2, subtitleID: 3,
+            subtitlePolicy: .includeSelected))?.isBitmap == true)
+
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sidecarURL = directory.appendingPathComponent("Film.en.ass")
+        try Data("[Script Info]".utf8).write(to: sidecarURL)
+        let sidecar = try XCTUnwrap(ExternalSubtitleDescriptor.make(url: sidecarURL))
+        let external = TrackSelection(audioID: 2, subtitle: .external(sidecar), subtitlePolicy: .burnInSelected)
+        XCTAssertEqual(SubtitleBurnIn.selected(in: source, selection: external, input: input)?.source,
+                       .text(path: sidecar.standardizedURL.path, subtitleIndex: nil, isASS: true))
+    }
+
+    func testTextBurnInPlansUseSubtitlesFilterChain() {
+        let source = withPGS(video("h264", profile: "High", pixelFormat: "yuv420p"))
+        let text = SubtitleBurnIn(source: .text(path: "/Movies/Film.mkv", subtitleIndex: 1, isASS: false))
+        let plan = TranscodePlanner.plan(info: source, intent: .local, selectedAudioID: 2,
+                                         requiresSubtitleMuxing: true, burnInSubtitle: text)
+        XCTAssertEqual(plan.reason, "The selected subtitle is burned into the video, which needs a full video encode.")
+        XCTAssertTrue(plan.steps.allSatisfy { $0.strategy == .hardwareEncode && $0.burnsInSubtitle })
+        XCTAssertEqual(plan.steps[0].videoArguments.prefix(2),
+                       ["-vf", "subtitles=filename=/Movies/Film.mkv:si=1:wrap_unicode=0,format=yuv420p"])
+        // libass has no offset, so video timestamps are shifted around it.
+        let later = TranscodePlanner.plan(info: source, intent: .airPlay, selectedAudioID: 2,
+            burnInSubtitle: SubtitleBurnIn(source: text.source, offsetSeconds: 0.4)).steps[0]
+        XCTAssertEqual(later.videoArguments[1], "setpts=PTS-0.400/TB,subtitles=filename=/Movies/Film.mkv:si=1:wrap_unicode=0,setpts=PTS+0.400/TB,format=yuv420p")
+        let earlier = TranscodePlanner.plan(info: source, intent: .airPlay, selectedAudioID: 2,
+            burnInSubtitle: SubtitleBurnIn(source: text.source, offsetSeconds: -0.25)).steps[0]
+        XCTAssertEqual(earlier.videoArguments[1], "setpts=PTS+0.250/TB,subtitles=filename=/Movies/Film.mkv:si=1:wrap_unicode=0,setpts=PTS-0.250/TB,format=yuv420p")
+        // HDR output dims plain text to graphics white; ASS keeps its styles.
+        let hdr = MediaInfo(formatName: "matroska,webm", duration: 120, videoCodec: "vp9", videoProfile: nil,
+            pixelFormat: "yuv420p10le", colorTransfer: "smpte2084", isDolbyVision: false,
+            tracks: [audioTrack("aac", channels: 2)], width: 1920, height: 1080, averageFrameRate: "24/1")
+        let dimmed = TranscodePlanner.plan(info: hdr, intent: .airPlay, selectedAudioID: 2, burnInSubtitle: text).steps[0]
+        XCTAssertEqual(dimmed.videoArguments[1], "subtitles=filename=/Movies/Film.mkv:si=1:force_style=PrimaryColour=&H00949494:wrap_unicode=0,setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc")
+        let ass = SubtitleBurnIn(source: .text(path: "/Movies/Film.ass", subtitleIndex: nil, isASS: true))
+        let styled = TranscodePlanner.plan(info: hdr, intent: .airPlay, selectedAudioID: 2, burnInSubtitle: ass).steps[0]
+        XCTAssertFalse(styled.videoArguments[1].contains("force_style"))
+    }
+
+    func testTextBurnInArgumentsKeepSingleInputAndDropSubtitleTrack() throws {
+        let source = withPGS(video("h264", profile: "High", pixelFormat: "yuv420p"))
+        let text = SubtitleBurnIn(source: .text(path: "/in.mkv", subtitleIndex: 1, isASS: false))
+        let step = TranscodePlanner.plan(info: source, intent: .local, selectedAudioID: 2, burnInSubtitle: text).steps[0]
+        let selection = TrackSelection(audioID: 2, subtitleID: 4, subtitlePolicy: .burnInSelected)
+        let args = try TranscodeService.ffmpegArguments(input: URL(fileURLWithPath: "/in.mkv"),
+            output: URL(fileURLWithPath: "/out.mp4"), step: step, selection: selection, sourceHasAudio: true,
+            syncAdjustment: SyncAdjustment(subtitleMilliseconds: 400))
+        XCTAssertEqual(args.indices.filter { args[$0] == "-i" }.count, 1)
+        XCTAssertEqual(args.indices.filter { args[$0] == "-map" }.map { args[$0 + 1] }, ["0:v:0", "0:2"])
+        XCTAssertTrue(args.contains("-sn"))
+        XCTAssertFalse(args.contains("mov_text"))
+        XCTAssertFalse(args.contains("-bsf:s"))
+        XCTAssertFalse(args.contains("-filter_complex"))
+    }
+
+    @MainActor
+    func testStoreKeepsBurnInAcrossSubtitleChanges() {
+        let store = PlaylistStore(preferencesStore: PlaybackPreferencesStore(defaults: UserDefaults(suiteName: UUID().uuidString)!))
+        let item = MediaItem(fileURL: URL(fileURLWithPath: "/tmp/Film.mkv"))
+        store.setSubtitleBurnIn(true, for: item)
+        XCTAssertEqual(item.trackSelection.subtitlePolicy, .omit, "No subtitle selected, nothing to burn in")
+        store.chooseSubtitle(4, for: item)
+        XCTAssertEqual(item.trackSelection.subtitlePolicy, .includeSelected)
+        store.setSubtitleBurnIn(true, for: item)
+        XCTAssertEqual(item.trackSelection.subtitlePolicy, .burnInSelected)
+        store.chooseSubtitle(5, for: item)
+        XCTAssertEqual(item.trackSelection.subtitlePolicy, .burnInSelected)
+        store.chooseSubtitle(nil, for: item)
+        XCTAssertEqual(item.trackSelection.subtitlePolicy, .omit)
+    }
+
+    func testCachedCopyMustMatchSubtitlePolicy() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("source.mkv")
+        let output = directory.appendingPathComponent("source_airplay.mp4")
+        try Data("source".utf8).write(to: source)
+        try Data("output".utf8).write(to: output)
+        let soft = TrackSelection(audioID: nil, subtitleID: 4, subtitlePolicy: .includeSelected)
+        let burned = TrackSelection(audioID: nil, subtitleID: 4, subtitlePolicy: .burnInSelected)
+        // A manifest written before burn-in existed has no policy: the subtitle was a track.
+        try MediaArtifactValidator.writeManifest(source: source, artifact: output, sourceHadAudio: false,
+            selectedAudioID: nil, expectedDuration: nil, requiresHVC1: false, selectedSubtitle: .embedded(streamID: 4))
+        let legacyBurn = await MediaArtifactValidator.validateCached(output, source: source, expectedSelection: burned)
+        XCTAssertEqual(legacyBurn.reason, "No current artifact manifest")
+        let legacySoft = await MediaArtifactValidator.validateCached(output, source: source, expectedSelection: soft)
+        XCTAssertNotEqual(legacySoft.reason, "No current artifact manifest")
+        try MediaArtifactValidator.writeManifest(source: source, artifact: output, sourceHadAudio: false,
+            selectedAudioID: nil, expectedDuration: nil, requiresHVC1: false, selectedSubtitle: .embedded(streamID: 4),
+            subtitlePolicy: .burnInSelected)
+        let burnedCache = await MediaArtifactValidator.validateCached(output, source: source, expectedSelection: burned)
+        XCTAssertNotEqual(burnedCache.reason, "No current artifact manifest")
+    }
+
+    func testProbeToleratesUnexpectedSideDataFieldTypes() throws {
+        let data = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","side_data_list":[{"side_data_type":7,"rotation":"ninety","dv_profile":"eight"}]}],"format":{"format_name":"mp4","duration":"1.0"}}"#.data(using: .utf8)!
+        let mapped = FFprobeService.mediaInfo(from: try FFprobeService.parse(data))
+        XCTAssertEqual(mapped.videoCodec, "h264")
+        XCTAssertNil(mapped.rotation)
+        XCTAssertNil(mapped.dolbyVisionProfile)
     }
 
     func testProbeProcessDrainsLargeStderrWithoutHanging() async {
@@ -260,6 +1314,13 @@ final class AirPlayDropTests: XCTestCase {
         XCTAssertEqual(manifest.selectedAudioID, 5)
         XCTAssertTrue(manifest.requiresHVC1)
         XCTAssertEqual(manifest.playbackIntent, .local)
+        XCTAssertNil(manifest.appleTVRulesVersion)
+
+        try MediaArtifactValidator.writeManifest(source: source, artifact: output, sourceHadAudio: true,
+            selectedAudioID: 5, expectedDuration: 10, requiresHVC1: true, playbackIntent: .airPlay)
+        let airPlay = try JSONDecoder().decode(MediaArtifactManifest.self,
+            from: Data(contentsOf: MediaArtifactValidator.manifestURL(for: output)))
+        XCTAssertEqual(airPlay.appleTVRulesVersion, AppleTVVideoCompatibility.rulesVersion)
     }
 
     func testManifestWriteFailsWhenSourceMissing() throws {
@@ -283,6 +1344,24 @@ final class AirPlayDropTests: XCTestCase {
         defaults.set(directory.path, forKey: FFmpegLocator.configuredDirectoryKey)
         XCTAssertEqual(FFmpegLocator.locate(defaults: defaults, environment: [:])?.ffmpeg.deletingLastPathComponent().standardizedFileURL,
             directory.standardizedFileURL)
+    }
+
+    func testBundledFFmpegIsUsedWithoutExternalInstallation() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for name in ["ffmpeg", "ffprobe"] {
+            let url = directory.appendingPathComponent(name)
+            try Data("#!/bin/sh\n".utf8).write(to: url)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
+        let suite = "AirPlayDropTests.\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let installation = FFmpegLocator.locate(defaults: defaults, environment: [:], bundledDirectory: directory)
+        XCTAssertEqual(installation?.ffmpeg.deletingLastPathComponent().standardizedFileURL,
+                       directory.standardizedFileURL)
     }
 
     func testJobRegistryRejectsStaleCompletion() {

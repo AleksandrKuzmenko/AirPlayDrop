@@ -20,8 +20,7 @@ struct VideoFormatProbe {
         }
 
         for desc in descriptions {
-            if CMFormatDescriptionGetExtension(
-                desc, extensionKey: "DolbyVisionConfiguration" as CFString) != nil {
+            if hasDolbyVisionConfiguration(desc) {
                 flags.insert(.dolbyVision)
             }
             if let transfer = CMFormatDescriptionGetExtension(
@@ -38,6 +37,22 @@ struct VideoFormatProbe {
         return flags
     }
 
+    /// AVFoundation exposes the MP4 Dolby Vision configuration box only as a
+    /// raw sample-description extension atom.
+    static func hasDolbyVisionConfiguration(_ description: CMFormatDescription) -> Bool {
+        guard let atoms = CMFormatDescriptionGetExtension(description,
+                extensionKey: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms) as? [String: Any] else {
+            return false
+        }
+        return ["dvcC", "dvvC", "dvwC"].contains { atoms[$0] != nil }
+    }
+
+    /// A Dolby Vision HEVC (`dvh1`) sample entry with its configuration box.
+    static func isDolbyVisionSampleEntry(_ description: CMFormatDescription) -> Bool {
+        CMFormatDescriptionGetMediaSubType(description) == kCMVideoCodecType_DolbyVisionHEVC
+            && hasDolbyVisionConfiguration(description)
+    }
+
     /// Returns true for the HEVC `hvc1` sample entry produced by the AirPlay HDR
     /// conversion. A generic FFmpeg remux normally produces `hev1`; although both
     /// contain HEVC, Apple playback paths are more reliable when parameter sets
@@ -52,8 +67,11 @@ struct VideoFormatProbe {
             return false
         }
 
+        // A dvh1 entry with its configuration box is the Dolby Vision
+        // passthrough produced for profile 5, which Apple TV decodes.
         return descriptions.contains { description in
             CMFormatDescriptionGetMediaSubType(description) == kCMVideoCodecType_HEVC
+                || isDolbyVisionSampleEntry(description)
         }
     }
 }

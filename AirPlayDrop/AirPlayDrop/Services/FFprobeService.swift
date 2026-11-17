@@ -84,14 +84,63 @@ struct FFprobeStream: Codable, Equatable, Sendable {
     let profile: String?
     let pix_fmt: String?
     let color_transfer: String?
-    let side_data_list: [[String: String]]?
+    let side_data_list: [FFprobeSideData]?
+    var color_primaries: String? = nil
+    var color_space: String? = nil
+    var width: Int? = nil
+    var height: Int? = nil
+    var avg_frame_rate: String? = nil
+    var bit_rate: String? = nil
+    var field_order: String? = nil
 
     var isForced: Bool { disposition?["forced"] == 1 }
+}
+
+/// One entry of an FFprobe `side_data_list`. FFprobe emits a mix of strings and
+/// numbers here (for example `rotation`, `max_content`, and `dv_profile` are
+/// integers), so only the fields AirPlayDrop uses are decoded. Each field is
+/// decoded leniently: an unexpected type drops that field instead of failing
+/// the entire probe.
+struct FFprobeSideData: Codable, Equatable, Sendable {
+    let side_data_type: String?
+    let dv_profile: Int?
+    let dv_bl_signal_compatibility_id: Int?
+    let el_present_flag: Int?
+    let rotation: Double?
+
+    init(side_data_type: String?, dv_profile: Int? = nil,
+         dv_bl_signal_compatibility_id: Int? = nil, el_present_flag: Int? = nil, rotation: Double? = nil) {
+        self.side_data_type = side_data_type
+        self.dv_profile = dv_profile
+        self.dv_bl_signal_compatibility_id = dv_bl_signal_compatibility_id
+        self.el_present_flag = el_present_flag
+        self.rotation = rotation
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case side_data_type, dv_profile, dv_bl_signal_compatibility_id, el_present_flag, rotation
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        side_data_type = try? values.decodeIfPresent(String.self, forKey: .side_data_type)
+        dv_profile = try? values.decodeIfPresent(Int.self, forKey: .dv_profile)
+        dv_bl_signal_compatibility_id = try? values.decodeIfPresent(Int.self, forKey: .dv_bl_signal_compatibility_id)
+        el_present_flag = try? values.decodeIfPresent(Int.self, forKey: .el_present_flag)
+        rotation = try? values.decodeIfPresent(Double.self, forKey: .rotation)
+    }
+
+    var isDolbyVisionConfiguration: Bool {
+        guard let type = side_data_type else { return dv_profile != nil }
+        return type.localizedCaseInsensitiveContains("dolby vision")
+            || type.localizedCaseInsensitiveContains("dovi")
+    }
 }
 
 struct FFprobeFormat: Codable, Equatable, Sendable {
     let format_name: String?
     let duration: String?
+    var bit_rate: String? = nil
 }
 
 struct FFprobeResult: Codable, Equatable, Sendable {
@@ -193,13 +242,30 @@ enum FFprobeService {
                 isForced: stream.disposition?["forced"] == 1)
         }
         let sideData = video?.side_data_list ?? []
-        let isDV = sideData.contains { values in
-            values.values.contains { $0.localizedCaseInsensitiveContains("dolby vision") || $0.localizedCaseInsensitiveContains("dovi") }
-        }
+        let dolbyVision = sideData.first(where: \.isDolbyVisionConfiguration)
         return MediaInfo(formatName: result.format?.format_name,
             duration: result.format?.duration.flatMap(Double.init), videoCodec: video?.codec_name,
             videoProfile: video?.profile, pixelFormat: video?.pix_fmt, colorTransfer: video?.color_transfer,
-            isDolbyVision: isDV, tracks: tracks)
+            isDolbyVision: dolbyVision != nil, tracks: tracks,
+            dolbyVisionProfile: dolbyVision?.dv_profile,
+            dolbyVisionCompatibilityID: dolbyVision?.dv_bl_signal_compatibility_id,
+            dolbyVisionHasEnhancementLayer: dolbyVision?.el_present_flag.map { $0 == 1 },
+            rotation: sideData.compactMap(\.rotation).first,
+            colorPrimaries: video?.color_primaries,
+            colorSpace: video?.color_space,
+            width: video?.width, height: video?.height,
+            averageFrameRate: video?.avg_frame_rate,
+            videoBitRate: video.flatMap(streamBitRate),
+            containerBitRate: result.format?.bit_rate.flatMap { Int($0) },
+            fieldOrder: video?.field_order)
+    }
+
+    /// MP4 streams carry `bit_rate`; Matroska files muxed by mkvmerge carry a
+    /// `BPS` statistics tag instead, sometimes with a language suffix.
+    static func streamBitRate(_ stream: FFprobeStream) -> Int? {
+        if let rate = stream.bit_rate.flatMap({ Int($0) }) { return rate }
+        let tag = stream.tags?.first { $0.key.uppercased() == "BPS" || $0.key.uppercased().hasPrefix("BPS-") }
+        return tag.flatMap { Int($0.value) }
     }
 
     static func preferredAudio(from streams: [FFprobeStream], preferredLanguage: String? = Locale.current.language.languageCode?.identifier) -> FFprobeStream? {

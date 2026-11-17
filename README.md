@@ -1,37 +1,40 @@
 # AirPlayDrop
 
-AirPlayDrop is a native macOS utility for playing local video and preparing difficult media for reliable playback on Apple TV through AirPlay. It inspects each file, keeps compatible streams whenever possible, and uses a separately installed FFmpeg only when conversion or repackaging is required.
+AirPlayDrop is a native Apple-silicon macOS utility for playing local video and preparing difficult media for reliable playback on Apple TV through AirPlay. It inspects each file, keeps compatible streams whenever possible, and uses its bundled FFmpeg only when conversion or repackaging is required.
 
-The project is currently a **source-first 0.1.0 alpha**. It is intended for technically comfortable macOS users and contributors; signed and notarized application downloads are not available yet.
+The project is currently a **0.1.x alpha**. The release process produces an arm64-only, Developer ID-signed and Apple-notarized DMG; source builds remain supported for contributors.
 
 ## Features
 
 - Drag-and-drop playlist and native macOS playback controls.
 - AirPlay route selection and an explicit **Prepare for Apple TV / AirPlay** workflow.
-- Media probing before conversion, with named remux, audio-conversion, hardware-encode, and software fallback strategies.
-- Per-file audio-track and text-subtitle selection.
+- Media probing before conversion, with named remux, audio-conversion, and Apple VideoToolbox hardware-encode strategies.
+- Per-file audio-track and subtitle selection. Text subtitles are kept as selectable MP4 subtitles, or burned into the picture with **Burn Into Video**, keeping ASS styling; bitmap subtitles (Blu-ray PGS, DVD VobSub, DVB) are always burned in.
 - Preferred audio and subtitle languages for newly imported files.
 - Automatic discovery and manual attachment of external `.srt`, `.vtt`, `.ass`, and `.ssa` subtitles.
 - Per-file audio and subtitle synchronization adjustment from -10 to +10 seconds.
+- Apple TV video checks: video the Mac plays but Apple TV cannot decode, such as 10-bit or 4:2:2 H.264, 4:2:2 HEVC, AV1, video above 2160p or 60 fps, or interlaced video, is converted before AirPlay playback instead of streamed as-is. Interlaced video is deinterlaced to full frame rate whenever it is encoded.
+- AirPlay receiver setting: choose **Apple TV HD or SDR-only receiver** in Playback Settings to prepare 1080p SDR H.264 for receivers without HEVC or HDR. HDR video is then tone-mapped to SDR with Apple's VideoToolbox. The default, **Apple TV 4K or HDR receiver**, keeps HDR; an Apple TV 4K converts HDR for SDR televisions itself.
+- Surround audio preserved for Apple TV: AAC, AC3, and E-AC3 tracks are copied unchanged, and other multichannel audio is converted to E-AC3 up to 5.1.
 - Optional Late Night audio processing for quieter peaks and clearer dialogue.
 - Resume playback for unfinished videos and timeline thumbnail previews while scrubbing.
 - Cancellable conversion, progress reporting, actionable FFmpeg diagnostics, and reuse of validated prepared copies.
 
-AirPlayDrop does not implement Chromecast, a phone remote, subtitle OCR, Atmos passthrough, or persistent multi-playlist management.
+AirPlayDrop does not implement Chromecast, a phone remote, subtitle OCR, Atmos from TrueHD sources, or persistent multi-playlist management.
 
 ## Requirements
 
 - macOS 14 Sonoma or later.
+- A Mac with Apple silicon (M1 or later). Intel Macs are not supported.
 - Xcode 15.4 or later for source builds.
-- FFmpeg and FFprobe installed separately.
 
-The easiest dependency installation is Homebrew:
+Release DMGs include a minimal-dependency, arm64 FFmpeg/FFprobe build. No Homebrew installation is required. A source checkout can build the same pinned toolchain with:
 
 ```sh
-brew install ffmpeg
+./scripts/build-bundled-ffmpeg.sh
 ```
 
-AirPlayDrop searches `PATH`, `/opt/homebrew/bin`, `/usr/local/bin`, and `/usr/bin`. If the tools are elsewhere, open **AirPlayDrop → Settings** or click **FFmpeg Settings** in the toolbar, choose the directory containing both executables, and run the built-in version check.
+AirPlayDrop prefers an explicitly configured FFmpeg directory, then the tools bundled inside the app, followed by `PATH` and standard package-manager locations. The override under **AirPlayDrop → Settings** is useful for development or testing another trusted build.
 
 ## Build and run
 
@@ -68,7 +71,7 @@ The resulting development app is stored under Xcode's DerivedData directory. For
 
 Prepared MP4 files and their `.airplay.json` validation manifests are written beside the source video. The original media file is never overwritten. Changing track, synchronization, subtitle, or audio-processing choices invalidates the prepared selection and requires preparation again.
 
-Playback language preferences apply to files imported after the preference changes. Late Night mode uses dynamic-range compression and limiting; it is not speech isolation. Only text subtitles are supported—bitmap subtitle formats such as PGS require OCR and are intentionally out of scope.
+Playback language preferences apply to files imported after the preference changes. Late Night mode uses dynamic-range compression and limiting; it is not speech isolation. Text subtitles stay as separate MP4 subtitle tracks unless **Burn Into Video** is turned on in the item's Subtitles menu; burning in renders them with libass, keeps ASS styling, and needs a full video encode. Bitmap subtitles such as PGS cannot be stored in MP4 and are not converted to text, so choosing one burns it into the picture, which always needs a full video encode, takes longer, and can't be turned off during playback. Bitmap subtitles are never chosen automatically. On HDR video they are dimmed to BT.2408's 203-nit graphics white so they are not shown at peak brightness. Dolby Vision profile 5 video can't have subtitles burned in.
 
 ## Privacy and local data
 
@@ -76,24 +79,23 @@ Media never leaves the Mac through AirPlayDrop itself. The app does not contain 
 
 For resume playback, AirPlayDrop stores a bounded history of up to 100 local file identities and playback positions in macOS application preferences. Prepared-copy manifests contain source fingerprints and selected preparation options and remain beside the prepared video. Anyone receiving a copied manifest may be able to infer the original filename or folder structure, so omit `.airplay.json` files when sharing prepared videos.
 
-FFmpeg and FFprobe are separate programs executed locally with structured argument arrays. Their licensing and enabled codecs depend on the installation selected by the user.
+FFmpeg and FFprobe are separate programs executed locally with structured argument arrays. Release builds bundle a pinned LGPL build with no GPL/nonfree components or network support. Its notices are inside the app and the corresponding source archive is published with each DMG. A user-configured external build may have different licensing and capabilities.
 
 ## Troubleshooting
 
 ### FFmpeg is not found
 
-Confirm both commands work in Terminal:
+The signed release includes both tools. If a development build cannot find them, build the pinned copies:
 
 ```sh
-ffmpeg -version
-ffprobe -version
+./scripts/build-bundled-ffmpeg.sh
 ```
 
-Then use **FFmpeg Settings** to select their common directory and run the version check.
+Alternatively, use **FFmpeg Settings** to select a trusted directory containing `ffmpeg` and `ffprobe`, then run the version check.
 
 ### Audio plays but video is black on Apple TV
 
-Stop playback and use **Prepare for → Apple TV / AirPlay**. Dolby Vision and some HEVC-in-MKV files need an AirPlay-safe MP4 sample entry or an HDR10-compatible fallback.
+Stop playback and use **Prepare for → Apple TV / AirPlay**. Dolby Vision and some HEVC-in-MKV files need an AirPlay-safe MP4 sample entry or an HDR10-compatible fallback. Dolby Vision profile 5 files have no HDR10 fallback and are kept as Dolby Vision instead. AirPlayDrop also converts camera and editing formats that the Mac plays but Apple TV cannot decode, such as 10-bit or 4:2:2 H.264 and 4:2:2 HEVC, when playback starts on an AirPlay route.
 
 ### The wrong audio or subtitle track was selected
 
@@ -113,13 +115,13 @@ Run the complete local verification gate from the repository root:
 
 The script runs the unsigned Debug build, all unit tests, and `git diff --check`. Tests use generated fixtures and mocks; copyrighted or personal media must never be committed.
 
-The project has no Swift package dependencies. It links Apple AVFoundation and AVKit and expects FFmpeg/FFprobe at runtime for probing and preparation.
+The project has no Swift package dependencies. It links Apple AVFoundation and AVKit. Packaged releases include the pinned FFmpeg/FFprobe runtime; ordinary Xcode debug builds can use either that locally built runtime or a trusted external installation.
 
 ## Distribution
 
-The alpha is distributed as source only. See [AirPlayDrop/docs/DISTRIBUTION.md](AirPlayDrop/docs/DISTRIBUTION.md) for the signing, notarization, architecture, checksum, and multimedia-licensing requirements that apply before binary distribution.
+See [AirPlayDrop/docs/DISTRIBUTION.md](AirPlayDrop/docs/DISTRIBUTION.md) for the Apple-silicon packaging, signing, notarization, checksum, and FFmpeg licensing procedure.
 
-Version tags create immutable source archives and SHA-256 checksums through GitHub Actions. Unsigned application bundles are intentionally not published.
+Release assets include the signed and notarized arm64 DMG, its SHA-256 checksum, and the exact FFmpeg source archive and checksum required to reproduce the bundled LGPL binaries. Unsigned application bundles are not published.
 
 ## Contributing and security
 
