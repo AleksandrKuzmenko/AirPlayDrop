@@ -2,7 +2,7 @@
 
 AirPlayDrop is a native Apple-silicon macOS utility for playing local video and preparing difficult media for reliable playback on Apple TV through AirPlay. It inspects each file, keeps compatible streams whenever possible, and uses its bundled FFmpeg only when conversion or repackaging is required.
 
-The project is currently a **0.1.x alpha**. The release process produces an arm64-only, Developer ID-signed and Apple-notarized DMG; source builds remain supported for contributors.
+The project is currently a **0.2.x alpha**. The release process produces an arm64-only, Developer ID-signed and Apple-notarized DMG; source builds remain supported for contributors.
 
 ## Features
 

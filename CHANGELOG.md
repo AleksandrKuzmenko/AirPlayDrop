@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0-alpha — 2026-11-18
 
 - Added an Apple-silicon-only DMG packaging pipeline with hardened-runtime signing and Apple notarization.
 - Added pinned LGPL FFmpeg 9.0.2 and FFprobe builds with no GPL/nonfree components or network support.

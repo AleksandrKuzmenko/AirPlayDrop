@@ -2,7 +2,7 @@
 set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-version="${AIRPLAYDROP_VERSION:-0.1.0}"
+version="${AIRPLAYDROP_VERSION:-0.2.0}"
 build_root="${AIRPLAYDROP_BUILD_ROOT:-$repo_root/.build}"
 ffmpeg_root="$build_root/ffmpeg-arm64"
 derived_data="$build_root/DerivedData-Release"
